@@ -16,7 +16,6 @@ This project is about training a simulated self-driving car using reinforcement 
 
   6)Training Enhancements: It includes features like hyperparameter tuning (using optuna), checkpointing (to save progress), and detailed logging to track how the training is going.
 
-Overall, the goal is to train an AI agent to navigate a complex driving environment safely and efficiently.
 ------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Videos showing the project:

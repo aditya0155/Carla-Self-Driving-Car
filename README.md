@@ -48,10 +48,8 @@ Make sure you're in the correct directory where the script is located when runni
 
 Features for futures release: (for contributors <3)
 
-1)If possible add a LIDAR visualization
+1) making the reward system better and better training features
 
-2) making the reward system better and better training features
-
-3) More training matrices for visualization
+2) More training matrices for visualization
 
 

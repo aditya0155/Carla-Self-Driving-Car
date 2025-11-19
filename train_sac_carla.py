@@ -314,7 +314,7 @@ def objective(trial):
 
         learning_rate=lr,
 
-        buffer_size=100000,
+        buffer_size=30000,
 
         learning_starts=1000,
 
@@ -544,7 +544,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=100000,
+            buffer_size=30000,
 
             learning_starts=1000,
 
@@ -578,5 +578,6 @@ if __name__ == "__main__":
     model_path = "sac_carla_model_enhanced"
 
     model.save(model_path)
+
 
     console.log(f"[bold green]Model saved to {model_path}[/bold green]")

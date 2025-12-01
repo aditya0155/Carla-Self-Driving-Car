@@ -26,6 +26,9 @@ from stable_baselines3.common.logger import configure
 
 import serial
 import time
+
+# Mixed Precision Training imports
+from torch.cuda.amp import GradScaler, autocast
     
 from carla_env import CarlaEnv, CustomSAC
 
@@ -231,29 +234,31 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations):
 
-        # Process image.
+        # Process image with Mixed Precision (FP16) for VRAM efficiency
 
-        if observations["image"].ndim == 4 and observations["image"].shape[1] == 3:
+        with autocast(enabled=torch.cuda.is_available()):
 
-            image = observations["image"].float() / 255.0
+            if observations["image"].ndim == 4 and observations["image"].shape[1] == 3:
 
-        else:
+                image = observations["image"].float() / 255.0
 
-            image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
+            else:
 
-        
+                image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
 
-        image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
+            
 
-        state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
+            image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
 
-        
+            state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
+
+            
 
 
 
-        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
+            attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
 
-        fused_state = state_features * attn_weights
+            fused_state = state_features * attn_weights
 
         
 
@@ -361,6 +366,8 @@ def objective(trial):
         learning_rate=lr,
 
         buffer_size=30000,
+
+        optimize_memory_usage=True,  # Reduces RAM by ~50%
 
         learning_starts=1000,
 
@@ -589,6 +596,8 @@ if __name__ == "__main__":
             learning_rate=learning_rate,
 
             buffer_size=30000,
+
+            optimize_memory_usage=True,  # Reduces RAM by ~50% (stores next_obs by reference)
 
             learning_starts=1000,
 

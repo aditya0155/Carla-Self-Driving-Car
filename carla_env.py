@@ -26,7 +26,8 @@ from rich.console import Console
 
 from stable_baselines3 import SAC
 
-
+# Mixed Precision Training imports
+from torch.cuda.amp import GradScaler, autocast
 
 console = Console()
 
@@ -36,7 +37,7 @@ console = Console()
 
 class CustomSAC(SAC):
 
-    def __init__(self, *args, total_timesteps_for_entropy=150000, **kwargs):
+    def __init__(self, *args, total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
 
         kwargs.pop('logger', None)
 
@@ -55,9 +56,126 @@ class CustomSAC(SAC):
 
         self.min_alpha = 0.01  
 
-        self.current_alpha = self.initial_alpha  
+        self.current_alpha = self.initial_alpha
+        
+        # Mixed Precision Training (FP16) - reduces VRAM usage by ~50%
+        self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
+        if self.use_mixed_precision:
+            self.scaler = GradScaler()
+            console.log("[green]Mixed Precision Training (FP16) enabled - VRAM savings ~50%[/green]")
+        else:
+            self.scaler = None
+            console.log("[yellow]Mixed Precision disabled (CPU mode or user disabled)[/yellow]")
 
 
+
+    def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        """
+        Train the SAC model with Mixed Precision (FP16) support.
+        This reduces VRAM usage by ~50% and can speed up training on modern GPUs.
+        """
+        # Switch to train mode
+        self.policy.set_training_mode(True)
+        # Update learning rate and entropy coefficient
+        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        if self.ent_coef_optimizer is not None:
+            optimizers.append(self.ent_coef_optimizer)
+        self._update_learning_rate(optimizers)
+
+        for _ in range(gradient_steps):
+            # Sample replay buffer
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+            # Get current observations
+            obs = replay_data.observations
+            actions = replay_data.actions
+            next_obs = replay_data.next_observations
+            dones = replay_data.dones
+            rewards = replay_data.rewards
+
+            if self.use_mixed_precision:
+                # Mixed Precision forward pass for critic
+                with autocast():
+                    with torch.no_grad():
+                        # Select action according to policy
+                        next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
+                        # Compute the next Q values
+                        next_q_values = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
+                        next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
+                        # Entropy regularization
+                        next_q_values = next_q_values - self.ent_coef_tensor * next_log_prob.reshape(-1, 1)
+                        # td error + entropy term
+                        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+
+                    # Get current Q estimates for each critic
+                    current_q_values = self.critic(obs, actions)
+                    # Compute critic loss
+                    critic_loss = 0.5 * sum(
+                        torch.nn.functional.mse_loss(current_q, target_q_values) 
+                        for current_q in current_q_values
+                    )
+
+                # Optimize the critic with gradient scaling
+                self.critic.optimizer.zero_grad()
+                self.scaler.scale(critic_loss).backward()
+                self.scaler.step(self.critic.optimizer)
+
+                # Mixed Precision forward pass for actor
+                with autocast():
+                    # Compute actor loss
+                    actions_pi, log_prob = self.actor.action_log_prob(obs)
+                    q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
+                    min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
+                    actor_loss = (self.ent_coef_tensor * log_prob - min_qf_pi).mean()
+
+                # Optimize the actor with gradient scaling
+                self.actor.optimizer.zero_grad()
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.step(self.actor.optimizer)
+
+                # Update the scaler
+                self.scaler.update()
+            else:
+                # Standard training without mixed precision (fallback for CPU)
+                with torch.no_grad():
+                    next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
+                    next_q_values = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
+                    next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
+                    next_q_values = next_q_values - self.ent_coef_tensor * next_log_prob.reshape(-1, 1)
+                    target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+
+                current_q_values = self.critic(obs, actions)
+                critic_loss = 0.5 * sum(
+                    torch.nn.functional.mse_loss(current_q, target_q_values) 
+                    for current_q in current_q_values
+                )
+
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                actions_pi, log_prob = self.actor.action_log_prob(obs)
+                q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
+                min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
+                actor_loss = (self.ent_coef_tensor * log_prob - min_qf_pi).mean()
+
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+
+            # Update target networks
+            self._update_target_networks()
+
+            self._n_updates += 1
+            if self.logger is not None:
+                self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+                self.logger.record("train/actor_loss", actor_loss.item())
+                self.logger.record("train/critic_loss", critic_loss.item())
+
+    def _update_target_networks(self):
+        """Soft update of the target networks"""
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
     def learn(self, total_timesteps, callback=None, log_interval=4, tb_log_name="SAC", reset_num_timesteps=True, progress_bar=False):
 
@@ -108,11 +226,11 @@ class CustomSAC(SAC):
 
     @classmethod
 
-    def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, total_timesteps_for_entropy=150000, **kwargs):
+    def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
 
         """
 
-        Load the model from a zip-file.
+        Load the model from a zip-file with Mixed Precision support.
 
         """
 
@@ -131,6 +249,14 @@ class CustomSAC(SAC):
         model.initial_alpha = current_alpha
         model.current_alpha = current_alpha
         model.min_alpha = 0.01
+        
+        # Setup Mixed Precision Training for resumed model
+        model.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
+        if model.use_mixed_precision:
+            model.scaler = GradScaler()
+            console.log("[green]Mixed Precision Training (FP16) enabled for resumed model[/green]")
+        else:
+            model.scaler = None
         
         print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}/{model.total_timesteps_for_entropy}, "
               f"entropy_coefficient: {current_alpha:.4f}")

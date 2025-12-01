@@ -26,8 +26,8 @@ from rich.console import Console
 
 from stable_baselines3 import SAC
 
-# Mixed Precision Training imports
-from torch.cuda.amp import GradScaler, autocast
+# Mixed Precision Training imports (updated for PyTorch 2.x)
+from torch.amp import GradScaler, autocast
 
 console = Console()
 
@@ -149,7 +149,7 @@ class CustomSAC(SAC):
 
             if self.use_mixed_precision:
                 # Mixed Precision forward pass for critic
-                with autocast():
+                with autocast(device_type='cuda'):
                     with torch.no_grad():
                         # Select action according to policy
                         next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
@@ -178,7 +178,7 @@ class CustomSAC(SAC):
                 self.scaler.step(self.critic.optimizer)
 
                 # Mixed Precision forward pass for actor
-                with autocast():
+                with autocast(device_type='cuda'):
                     # Compute actor loss
                     actions_pi, log_prob = self.actor.action_log_prob(obs)
                     q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
@@ -195,7 +195,7 @@ class CustomSAC(SAC):
                 
                 # Update entropy coefficient (if using automatic tuning)
                 if self.ent_coef_optimizer is not None:
-                    with autocast():
+                    with autocast(device_type='cuda'):
                         ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                     self.ent_coef_optimizer.zero_grad()
                     self.scaler.scale(ent_coef_loss).backward()
@@ -351,7 +351,8 @@ class CarlaEnv(gym.Env):
 
     def __init__(self, num_npcs=5, frame_skip=8, visualize=True,
 
-                 fixed_delta_seconds=0.05, camera_width=84, camera_height=84, model=None, arduino_port='/dev/ttyACM0'):
+                 fixed_delta_seconds=0.05, camera_width=84, camera_height=84, model=None, 
+                 arduino_port='/dev/ttyACM0', rotate_maps=True):
 
         # Add Arduino serial communication setup
         try:
@@ -361,6 +362,9 @@ class CarlaEnv(gym.Env):
         except Exception as e:
             console.log(f"[red]Failed to connect to Arduino: {e}[/red]")
             self.arduino = None
+        
+        # Store rotate_maps setting (will be used after connecting to CARLA)
+        self._rotate_maps_setting = rotate_maps
             
         super(CarlaEnv, self).__init__()
         self.visualize = visualize
@@ -425,6 +429,23 @@ class CarlaEnv(gym.Env):
 
         self.world = self.client.get_world()
 
+        
+        # Map rotation settings
+        self.rotate_maps = self._rotate_maps_setting  # Enable/disable map rotation
+        self.available_maps = self._get_available_maps()
+        self.current_map_index = 0
+        self.fixed_delta_seconds = fixed_delta_seconds  # Store for reuse after map change
+        
+        # Explicitly log map rotation status for debugging
+        console.log(f"[bold cyan]╔═══════════════════════════════════════════════════════╗[/bold cyan]")
+        console.log(f"[bold cyan]║           MAP ROTATION CONFIGURATION                  ║[/bold cyan]")
+        console.log(f"[bold cyan]╠═══════════════════════════════════════════════════════╣[/bold cyan]")
+        console.log(f"[cyan]║ rotate_maps setting: {self.rotate_maps}[/cyan]")
+        console.log(f"[cyan]║ Number of maps found: {len(self.available_maps)}[/cyan]")
+        console.log(f"[cyan]║ Available maps: {self.available_maps}[/cyan]")
+        console.log(f"[cyan]║ Will rotate: {self.rotate_maps and len(self.available_maps) > 1}[/cyan]")
+        console.log(f"[bold cyan]╚═══════════════════════════════════════════════════════╝[/bold cyan]")
+
 
 
         # Enable synchronous mode.
@@ -442,20 +463,11 @@ class CarlaEnv(gym.Env):
         console.log(f"[green]Synchronous mode enabled (fixed_delta_seconds = {fixed_delta_seconds})[/green]")
 
 
-
-        # Setup PyGame window if visualizing.
-
-        if self.visualize:
-
-            pygame.init()
-
-            self.display = pygame.display.set_mode((self.display_width, self.display_height))
-
-            pygame.display.set_caption("Driver's View")
-
-            self.clock = pygame.time.Clock()
-
-
+        
+        # BEV (Bird's Eye View) Occupancy Grid for LIDAR - MUST be defined before observation_space!
+        self.bev_grid_size = 64  # Grid resolution (64x64)
+        self.bev_range = 40.0   # Total range in meters (40m x 40m area)
+        self.bev_resolution = self.bev_range / self.bev_grid_size  # meters per pixel
 
         # Expand observation space.
 
@@ -463,7 +475,12 @@ class CarlaEnv(gym.Env):
 
             "image": spaces.Box(low=0, high=255, shape=(camera_height, camera_width, 3), dtype=np.uint8),
 
-            "state": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+            "state": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
+            
+            # BEV LIDAR occupancy grid: 64x64 single-channel image
+            # Values: 0 = free space, 255 = occupied (uint8 for memory efficiency)
+            # Using uint8 saves 75% memory vs float32 (60MB vs 240MB in replay buffer)
+            "lidar_bev": spaces.Box(low=0, high=255, shape=(self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)
 
         })
 
@@ -530,6 +547,9 @@ class CarlaEnv(gym.Env):
         self.lidar_sensor = None
 
         self.lidar_min_distance = float('inf')
+        
+        # BEV occupancy grid (bev_grid_size already defined above before observation_space)
+        self.lidar_bev = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)
 
 
 
@@ -560,13 +580,133 @@ class CarlaEnv(gym.Env):
 
         # State normalization parameters (for normalizing state to ~[-1, 1] range)
         # These are approximate ranges based on typical CARLA values
-        self.state_mean = np.array([0.0, 0.0, 10.0, 0.0, 25.0], dtype=np.float32)  # [x, y, speed, yaw, lidar]
-        self.state_std = np.array([200.0, 200.0, 15.0, 180.0, 25.0], dtype=np.float32)  # Std dev for normalization
+        self.state_mean = np.array([0.0, 0.0, 10.0, 0.0, 12.5], dtype=np.float32)  # [x, y, speed, yaw, lidar]
+        self.state_std = np.array([200.0, 200.0, 15.0, 180.0, 12.5], dtype=np.float32)  # Std dev for normalization (lidar: 25m/2)
         
         # Image augmentation flag (enabled during training for robustness)
         self.use_augmentation = True
 
         self.spawn_npcs()
+
+    def _get_available_maps(self):
+        """
+        Get list of available maps from CARLA server.
+        Filters to only include standard Town maps (excludes layered _Opt versions).
+        """
+        try:
+            all_maps = self.client.get_available_maps()
+            console.log(f"[cyan][MAP DETECTION] All available maps from CARLA: {all_maps}[/cyan]")
+            
+            # Filter to get only standard Town maps (Town01-Town10), exclude _Opt layered versions
+            standard_maps = [
+                m for m in all_maps 
+                if 'Town' in m and '_Opt' not in m and 'Template' not in m
+            ]
+            # Sort by town number for consistent ordering
+            standard_maps.sort()
+            
+            if not standard_maps:
+                console.log("[yellow]No standard Town maps found, using current map only[/yellow]")
+                current_map = self.world.get_map().name
+                return [current_map]
+            
+            console.log(f"[green][MAP DETECTION] Filtered standard maps: {standard_maps}[/green]")
+            return standard_maps
+        except Exception as e:
+            console.log(f"[red]Error getting available maps: {e}[/red]")
+            import traceback
+            console.log(f"[red]{traceback.format_exc()}[/red]")
+            return [self.world.get_map().name]
+    
+    def _change_map(self, map_name):
+        """
+        Change to a different map. This reloads the entire world.
+        
+        Args:
+            map_name: Name of the map to load (e.g., 'Town01', '/Game/Carla/Maps/Town01')
+            
+        CRITICAL: Uses reset_settings=False to preserve synchronous mode.
+        Without this, CARLA resets to async mode which breaks training.
+        """
+        try:
+            console.log(f"[magenta][MAP CHANGE] Loading map: {map_name}[/magenta]")
+            
+            # Destroy all existing actors first
+            self._cleanup_actors()
+            
+            # CRITICAL: Use reset_settings=False to preserve synchronous mode!
+            # Default is True which resets sync mode to False and breaks training.
+            # See: https://carla.readthedocs.io/en/latest/python_api/#carla.Client.load_world
+            self.world = self.client.load_world(map_name, reset_settings=False)
+            
+            # Wait for the world to be fully ready (increased from 2.0s for stability)
+            time.sleep(3.0)
+            
+            # Double-check and enforce synchronous mode on the new world
+            # Even with reset_settings=False, we re-apply to be safe
+            settings = self.world.get_settings()
+            if not settings.synchronous_mode:
+                console.log(f"[yellow][MAP CHANGE] Sync mode was reset! Re-enabling...[/yellow]")
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = self.fixed_delta_seconds
+            self.world.apply_settings(settings)
+            
+            # Tick more times to fully stabilize the new world (increased from 5)
+            for _ in range(10):
+                self.world.tick()
+            
+            # Re-spawn NPCs on the new map
+            self.npc_vehicles = []  # Clear old NPC list
+            self.spawn_npcs()
+            
+            # Verify the map actually changed
+            new_map_name = self.world.get_map().name
+            console.log(f"[green][MAP CHANGE] Successfully loaded: {new_map_name}[/green]")
+            return True
+            
+        except Exception as e:
+            console.log(f"[red][MAP CHANGE] Failed to load map {map_name}: {e}[/red]")
+            import traceback
+            console.log(f"[red]{traceback.format_exc()}[/red]")
+            return False
+    
+    def _cleanup_actors(self):
+        """Clean up all spawned actors before map change."""
+        try:
+            # Destroy sensors
+            for sensor in [self.camera, self.collision_sensor, self.lane_invasion_sensor,
+                          self.imu_sensor, self.lidar_sensor]:
+                if sensor is not None:
+                    try:
+                        sensor.destroy()
+                    except:
+                        pass
+            
+            # Destroy vehicle
+            if self.vehicle is not None:
+                try:
+                    self.vehicle.destroy()
+                except:
+                    pass
+            
+            # Destroy NPCs
+            for npc in self.npc_vehicles:
+                try:
+                    npc.destroy()
+                except:
+                    pass
+            
+            # Reset references
+            self.vehicle = None
+            self.camera = None
+            self.collision_sensor = None
+            self.lane_invasion_sensor = None
+            self.imu_sensor = None
+            self.lidar_sensor = None
+            self.npc_vehicles = []
+            
+        except Exception as e:
+            console.log(f"[yellow]Warning during actor cleanup: {e}[/yellow]")
 
 
 
@@ -648,6 +788,49 @@ class CarlaEnv(gym.Env):
 
         self.episode_count += 1
         
+        # Map rotation: change map on EVERY episode when enabled
+        # This provides maximum environment diversity for better generalization
+        # Note: Map loading takes ~2-5 seconds, so training will be slower
+        should_rotate = (
+            self.rotate_maps and 
+            len(self.available_maps) > 1
+        )
+        
+        if should_rotate:
+            # Pick a random map (different from current one)
+            # Extract just the map name (e.g., "Town01") from full path for comparison
+            current_map_full = self.world.get_map().name
+            current_map_name = current_map_full.split('/')[-1] if '/' in current_map_full else current_map_full
+            
+            console.log(f"[bold magenta]═══════════════════════════════════════════════════════[/bold magenta]")
+            console.log(f"[bold magenta][MAP ROTATION] Episode {self.episode_count} - Rotating map![/bold magenta]")
+            console.log(f"[cyan][MAP ROTATION] Current map: {current_map_name}[/cyan]")
+            console.log(f"[cyan][MAP ROTATION] Available maps: {self.available_maps}[/cyan]")
+            
+            # Filter out current map by checking if map name appears in either string
+            available_choices = []
+            for m in self.available_maps:
+                m_name = m.split('/')[-1] if '/' in m else m
+                if m_name != current_map_name:
+                    available_choices.append(m)
+            
+            if available_choices:
+                next_map = random.choice(available_choices)
+                console.log(f"[bold yellow][MAP ROTATION] CHANGING TO: {next_map}[/bold yellow]")
+                console.log(f"[bold magenta]═══════════════════════════════════════════════════════[/bold magenta]")
+                success = self._change_map(next_map)
+                if not success:
+                    console.log(f"[red][MAP ROTATION] Map change failed! Continuing with current map.[/red]")
+            else:
+                console.log(f"[yellow][MAP ROTATION] No other maps available, staying on {current_map_name}[/yellow]")
+                console.log(f"[bold magenta]═══════════════════════════════════════════════════════[/bold magenta]")
+        else:
+            # Log why we're NOT rotating (for debugging)
+            if not self.rotate_maps:
+                console.log(f"[dim][MAP ROTATION] Disabled by setting[/dim]")
+            elif len(self.available_maps) <= 1:
+                console.log(f"[dim][MAP ROTATION] Only 1 map available: {self.available_maps}[/dim]")
+        
         # Update model reference if it was passed through DummyVecEnv
         if hasattr(self, 'venv') and hasattr(self.venv, 'envs'):
             self.model = self.venv.envs[0].model
@@ -659,6 +842,7 @@ class CarlaEnv(gym.Env):
         self.previous_acceleration = 0.0  # Reset to prevent jerk calculation errors
         self.last_reward = 0.0
         self.lidar_min_distance = float('inf')  # Reset LIDAR to prevent stale data
+        self.lidar_bev = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)  # Reset BEV grid
         self.collision_history = False  # Reset collision flag for new episode
 
         resources_to_cleanup = []
@@ -898,23 +1082,26 @@ class CarlaEnv(gym.Env):
 
                 lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
 
-                # Optimized LIDAR settings
-
-                lidar_bp.set_attribute('range', '50')
-
-                lidar_bp.set_attribute('rotation_frequency', '10')
-
-                lidar_bp.set_attribute('channels', '16')  # Reduced from 32
-
-                lidar_bp.set_attribute('points_per_second', '20000')  # Reduced from 56000
-
-                lidar_bp.set_attribute('upper_fov', '10.0')
-
-                lidar_bp.set_attribute('lower_fov', '-30.0')
-
-                lidar_bp.set_attribute('horizontal_fov', '100.0')
-
-                lidar_transform = carla.Transform(carla.Location(x=1.5, z=3), carla.Rotation(pitch=-10))
+                # LIDAR settings optimized for BEV occupancy grid
+                # BEV grid is 40m x 40m, so we need full 360° coverage
+                lidar_bp.set_attribute('range', '25')  # Reduced: only need 20m + buffer for BEV
+                lidar_bp.set_attribute('rotation_frequency', '20')  # Match simulation rate
+                lidar_bp.set_attribute('channels', '32')  # More vertical resolution
+                lidar_bp.set_attribute('points_per_second', '100000')  # Dense point cloud for BEV
+                
+                # FOV settings:
+                # At z=1.8m height, lower_fov=-15° hits ground at ~6.7m
+                # This is acceptable - we filter ground in _on_lidar_update()
+                lidar_bp.set_attribute('upper_fov', '10.0')   # Look up for overhead obstacles
+                lidar_bp.set_attribute('lower_fov', '-15.0')  # Slightly more down angle for near obstacles
+                
+                # CRITICAL: Full 360° for complete BEV coverage
+                # Previous 120° only covered front, leaving sides/rear blind!
+                lidar_bp.set_attribute('horizontal_fov', '360.0')  # Full surround view
+                
+                # Position: roof level (z=1.8m) centered on vehicle
+                # x=0 (centered) for symmetric 360° coverage
+                lidar_transform = carla.Transform(carla.Location(x=0.0, z=1.8), carla.Rotation(pitch=0))
 
                 self.lidar_sensor = self.world.spawn_actor(lidar_bp, lidar_transform, attach_to=self.vehicle)
 
@@ -1020,10 +1207,13 @@ class CarlaEnv(gym.Env):
             # Clear the resources_to_cleanup list since we're successful
             resources_to_cleanup = []
             
+            # Get BEV LIDAR grid (add channel dimension)
+            lidar_bev_obs = self.lidar_bev[:, :, np.newaxis]  # Shape: (64, 64, 1)
 
             return {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
-                    "state": state}
+                    "state": state,
+                    "lidar_bev": lidar_bev_obs}
 
                     
 
@@ -1067,7 +1257,8 @@ class CarlaEnv(gym.Env):
 
             return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
-                    "state": default_state}
+                    "state": default_state,
+                    "lidar_bev": np.zeros((self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)}
 
 
 
@@ -1136,11 +1327,11 @@ class CarlaEnv(gym.Env):
         Normalize state values to approximately [-1, 1] range for better neural network training.
         Uses z-score normalization: (x - mean) / std
         
-        IMPORTANT: Clamps infinite LIDAR values to max range (50m) to prevent NaN in neural network.
+        IMPORTANT: Clamps infinite LIDAR values to max range (25m) to prevent NaN in neural network.
         """
-        # Clamp LIDAR distance (index 4) to max range of 50m to prevent inf
+        # Clamp LIDAR distance (index 4) to max range of 25m to prevent inf
         state = state.copy()
-        state[4] = min(state[4], 50.0)  # LIDAR max range is 50m
+        state[4] = min(state[4], 25.0)  # LIDAR max range is 25m (reduced for denser BEV)
         return (state - self.state_mean) / (self.state_std + 1e-8)
 
 
@@ -1168,24 +1359,122 @@ class CarlaEnv(gym.Env):
 
 
     def _on_lidar_update(self, lidar_measurement):
-
+        """
+        Process LIDAR data to:
+        1. Find minimum distance to obstacles (for state vector)
+        2. Generate BEV (Bird's Eye View) occupancy grid for spatial awareness
+        
+        LIDAR Configuration:
+        - Position: roof level (z=1.8m), centered (x=0)
+        - horizontal_fov = 360° (full surround view for BEV)
+        - lower_fov = -15° (hits ground at ~6.7m)
+        - range = 25m (sufficient for 20m BEV radius)
+        - 32 channels, 100k points/sec for dense BEV
+        
+        Ground Filtering Geometry:
+        - Sensor at 1.8m height, lower beam at -15°
+        - Ground plane: z_sensor = -1.8m (relative to LIDAR)
+        - At distance d, -15° beam z = -d * tan(15°) = -0.268 * d
+        - Simple z > -1.5m filter FAILS for d < 5.6m (ground passes!)
+        - Solution: Distance-dependent ground filter
+        
+        BEV Grid:
+        - 64x64 pixels covering 40m x 40m area (±20m from car)
+        - Vehicle is at center (grid[32, 32])
+        - Row 0 = 20m ahead (front), Row 63 = 20m behind (back)
+        - Col 0 = 20m right, Col 63 = 20m left
+        - Cell value: 0 = free, 255 = occupied
+        """
         points = np.frombuffer(lidar_measurement.raw_data, dtype=np.float32)
-
-        points = np.reshape(points, (-1, 4))
-
-        distances = np.linalg.norm(points[:, :3], axis=1)
-
-        # Filter out points that are too close (likely self-detections)
-
-        filtered = distances[distances > 2.0]  # Adjust threshold as needed
-
-        if filtered.size > 0:
-
-            self.lidar_min_distance = np.min(filtered)
-
+        points = np.reshape(points, (-1, 4))  # x, y, z, intensity
+        
+        if points.shape[0] == 0:
+            self.lidar_min_distance = float('inf')
+            self.lidar_bev = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)
+            return
+        
+        # Extract coordinates (LIDAR frame: x=forward, y=left, z=up)
+        x = points[:, 0]  # Forward (positive = front of car)
+        y = points[:, 1]  # Left/right (positive = left)
+        z = points[:, 2]  # Up/down relative to sensor (at 1.8m height)
+        
+        horizontal_dist = np.sqrt(x**2 + y**2)
+        
+        # ========== GEOMETRIC GROUND FILTERING ==========
+        # Problem: Simple z > -1.5m filter fails for close ground points
+        # 
+        # Ground plane is at z_ground = -1.8m (sensor at 1.8m above ground)
+        # Obstacle must be ABOVE ground to be valid
+        # 
+        # Method: Point must be at least 0.15m above ground plane
+        #         z_point > -1.8m + 0.15m = -1.65m (absolute ground threshold)
+        #         BUT we also add distance-dependent margin for sensor noise
+        #         
+        # Final: z > -1.65m AND z > (ground_ray_z + margin)
+        #        where ground_ray_z = -0.268 * dist (what -15° beam would hit at that dist)
+        #        margin = 0.3m (above the theoretical ground ray)
+        #
+        # This filters:
+        # - Actual ground reflections (z ≈ -1.8m at all distances)
+        # - Near-ground noise along the lower beam angle
+        
+        ground_threshold = -1.65  # Must be at least 0.15m above ground
+        ground_ray_z = -0.268 * horizontal_dist  # Theoretical -15° beam position
+        ground_margin = 0.3  # Must be 0.3m above where ground ray would be
+        
+        # Point is valid if ABOVE ground AND ABOVE the "ground ray + margin"
+        not_ground = (z > ground_threshold) & (z > ground_ray_z + ground_margin)
+        
+        # ========== SELF-DETECTION FILTER ==========
+        # Filter points within 0.5m (car body reflections)
+        not_self = horizontal_dist > 0.5
+        
+        # ========== VALID POINTS FOR MIN DISTANCE ==========
+        # For min distance: only consider points in driving corridor (|y| < 5m)
+        valid_mask = not_self & not_ground & (np.abs(y) < 5.0)
+        valid_distances = horizontal_dist[valid_mask]
+        
+        # Calculate minimum distance
+        if valid_distances.size > 0:
+            self.lidar_min_distance = np.min(valid_distances)
         else:
-
-            self.lidar_min_distance = np.min(distances) if distances.size > 0 else float('inf')
+            self.lidar_min_distance = float('inf')
+        
+        # ========== GENERATE BEV OCCUPANCY GRID ==========
+        # Reset grid (uint8 for memory efficiency: 60MB vs 240MB in replay buffer)
+        bev_grid = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)
+        
+        # Filter for BEV:
+        # - Must pass ground filter and self filter
+        # - Upper bound: ignore points > 3m above ground (overhangs, bridges)
+        upper_threshold = 1.2  # Relative to sensor: 1.8 + 1.2 = 3.0m above ground
+        bev_mask = not_self & not_ground & (z < upper_threshold)
+        
+        bev_x = x[bev_mask]
+        bev_y = y[bev_mask]
+        
+        if len(bev_x) > 0:
+            # Convert to grid coordinates
+            # Center of grid is vehicle position (grid_size/2, grid_size/2)
+            # x (forward) maps to grid row (0 = back, grid_size-1 = front)
+            # y (left/right) maps to grid col (0 = right, grid_size-1 = left)
+            
+            half_range = self.bev_range / 2.0
+            
+            # Normalize coordinates to [-1, 1] range, then to grid indices
+            # Flip x so forward is at the top of the grid
+            grid_row = ((half_range - bev_x) / self.bev_range * self.bev_grid_size).astype(np.int32)
+            grid_col = ((bev_y + half_range) / self.bev_range * self.bev_grid_size).astype(np.int32)
+            
+            # Clip to valid grid indices
+            grid_row = np.clip(grid_row, 0, self.bev_grid_size - 1)
+            grid_col = np.clip(grid_col, 0, self.bev_grid_size - 1)
+            
+            # Mark occupied cells with value 255 (uint8 max)
+            # Direct assignment is more efficient for uint8
+            bev_grid[grid_row, grid_col] = 255
+        
+        self.lidar_bev = bev_grid
 
 
 
@@ -1231,7 +1520,8 @@ class CarlaEnv(gym.Env):
             console.log("[red][STEP] Vehicle is None! Returning dummy observation.[/red]")
             default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
             return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
-                    "state": default_state}, -100.0, True, {"error": "vehicle_none"}
+                    "state": default_state,
+                    "lidar_bev": np.zeros((self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)}, -100.0, True, {"error": "vehicle_none"}
         
         # NOTE: previous_steering is updated AFTER reward calculation to compute steering change
         control = carla.VehicleControl(
@@ -1407,13 +1697,92 @@ class CarlaEnv(gym.Env):
 
             imu_penalty = 0.0
 
-        if self.lidar_min_distance < 2.0:
-
+        # Enhanced LIDAR reward using BEV occupancy grid instead of just minimum distance
+        # Analyze the BEV grid for spatial awareness
+        lidar_penalty = 0.0  # Initialize to 0 (CRITICAL: was missing before!)
+        
+        if hasattr(self, 'lidar_bev') and self.lidar_bev is not None:
+            bev = self.lidar_bev  # 64x64 uint8 grid
+            grid_center = self.bev_grid_size // 2  # 32
+            
+            # BEV Grid Coordinate System:
+            # - Row 0 = 20m AHEAD of car (front)
+            # - Row 32 = car position (center)
+            # - Row 63 = 20m BEHIND car (back)
+            # - Col 0 = 20m RIGHT of car
+            # - Col 32 = car center
+            # - Col 63 = 20m LEFT of car
+            
+            # Define regions of interest (corrected coordinates!)
+            # Front region: 0-20m ahead (rows 0-32), centered columns ±6m
+            front_cols_start = grid_center - 10  # ~6m right
+            front_cols_end = grid_center + 10    # ~6m left
+            front_region = bev[0:grid_center, front_cols_start:front_cols_end]
+            
+            # Close front region: 0-10m immediately ahead (rows 0-16, car-width columns)
+            close_front = bev[0:16, grid_center-8:grid_center+8]
+            
+            # Very close danger zone: 0-5m ahead (rows 0-8)
+            danger_zone = bev[0:8, grid_center-6:grid_center+6]
+            
+            # Left region: to the left of car (cols 42-63, rows near car)
+            # Now with 360° LIDAR, this region actually has data!
+            left_region = bev[grid_center-12:grid_center+12, grid_center+10:]
+            
+            # Right region: to the right of car (cols 0-22, rows near car)  
+            right_region = bev[grid_center-12:grid_center+12, 0:grid_center-10]
+            
+            # Rear region: behind the car (rows 48-63, centered columns)
+            # Important for reversing and situational awareness
+            rear_region = bev[grid_center+16:, grid_center-10:grid_center+10]
+            
+            # Calculate occupancy percentages (255 = occupied, 0 = free)
+            front_occupancy = np.mean(front_region) / 255.0  # 0-1 scale
+            close_front_occupancy = np.mean(close_front) / 255.0
+            danger_zone_occupancy = np.mean(danger_zone) / 255.0
+            left_occupancy = np.mean(left_region) / 255.0
+            right_occupancy = np.mean(right_region) / 255.0
+            rear_occupancy = np.mean(rear_region) / 255.0
+            
+            # ========== DISTANCE-WEIGHTED PENALTY SYSTEM ==========
+            # Based on physics: stopping distance at 30km/h ≈ 9m, at 50km/h ≈ 25m
+            
+            # Danger zone (0-5m): CRITICAL - immediate collision risk
+            # Max penalty when fully occupied: -25 * 1.0 = -25
+            danger_penalty = -danger_zone_occupancy * 25.0
+            
+            # Close front (0-10m): HIGH - reaction time zone
+            # Max penalty: -10 * 1.0 = -10
+            close_penalty = -close_front_occupancy * 10.0
+            
+            # Front (0-20m): MODERATE - planning horizon  
+            # Max penalty: -4 * 1.0 = -4
+            front_penalty = -front_occupancy * 4.0
+            
+            # Side obstacles: LIGHT - lane awareness (now with real data from 360° LIDAR!)
+            # Max penalty: -3 * (1.0 + 1.0) = -6
+            side_penalty = -(left_occupancy + right_occupancy) * 3.0
+            
+            # Rear obstacles: VERY LIGHT - only matters when reversing
+            # Max penalty: -1 * 1.0 = -1
+            rear_penalty = -rear_occupancy * 1.0
+            
+            # Total spatial awareness penalty
+            lidar_penalty = danger_penalty + close_penalty + front_penalty + side_penalty + rear_penalty
+            
+            # ========== BONUS FOR CLEAR PATH ==========
+            # Encourage the agent to find and maintain open driving corridors
+            if danger_zone_occupancy < 0.005 and close_front_occupancy < 0.01 and front_occupancy < 0.03:
+                lidar_penalty += 2.5  # Strong bonus for completely clear front
+            elif danger_zone_occupancy < 0.02 and close_front_occupancy < 0.05:
+                lidar_penalty += 1.0  # Moderate bonus for mostly clear
+            elif danger_zone_occupancy < 0.05:
+                lidar_penalty += 0.3  # Small bonus for acceptable clearance
+        
+        # Fallback to minimum distance if BEV not available
+        elif self.lidar_min_distance < 2.0:
             lidar_penalty = - (2.0 - self.lidar_min_distance) * 10.0
-
-        else:
-
-            lidar_penalty = 0.0
+        # else: lidar_penalty remains 0.0 (initialized above)
 
 
 
@@ -1436,18 +1805,27 @@ class CarlaEnv(gym.Env):
         # Store throttle and brake as instance variables
         self.previous_throttle = throttle  # Store for rendering
         self.previous_brake = brake  # Store for rendering
+        
+        # Get BEV LIDAR grid (add channel dimension)
+        lidar_bev_obs = self.lidar_bev[:, :, np.newaxis]  # Shape: (64, 64, 1)
 
         obs = {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
-               "state": state}
-        if self.lidar_min_distance < 2.0:
-            console.log(f"[blue][STEP] Loc=({current_location.x:.2f},{current_location.y:.2f}), "
-                        f"Speed={speed:.2f}, LIDAR_min={self.lidar_min_distance:.2f}, "
-                        f"Reward={reward:.2f}[/blue]")
-        else:
-            console.log(f"[blue][STEP] Loc=({current_location.x:.2f},{current_location.y:.2f}), "
-                        f"Speed={speed:.2f}, LIDAR_min={self.lidar_min_distance:.2f}, "
-                        f"Reward={reward:.2f}[/blue]")
+               "state": state,
+               "lidar_bev": lidar_bev_obs}
+        
+        # Calculate front occupancy for logging
+        danger_occ = 0.0
+        if hasattr(self, 'lidar_bev') and self.lidar_bev is not None:
+            grid_center = self.bev_grid_size // 2
+            danger_zone = self.lidar_bev[0:8, grid_center-6:grid_center+6]
+            danger_occ = np.mean(danger_zone) / 255.0
+        
+        # Log with color based on danger zone occupancy
+        log_color = "red" if danger_occ > 0.05 else "yellow" if danger_occ > 0.01 else "blue"
+        console.log(f"[{log_color}][STEP] Loc=({current_location.x:.2f},{current_location.y:.2f}), "
+                    f"Speed={speed:.2f}, DangerZone={danger_occ:.1%}, LidarPen={lidar_penalty:.1f}, "
+                    f"Reward={reward:.2f}[/{log_color}]")
         if self.visualize:
             self.render()
 
@@ -1482,188 +1860,210 @@ class CarlaEnv(gym.Env):
 
     def render(self, mode='human'):
         if self.visualize:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.close()
-                    return
+            # Non-blocking event processing - prevents freeze when window minimized
+            try:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.close()
+                        return
+                    # Handle window minimize/restore without blocking
+                    elif event.type == pygame.ACTIVEEVENT:
+                        pass  # Just consume the event, don't block
+            except Exception as e:
+                pass  # Ignore pygame event errors
 
             if self.camera_image is not None:
                 try:
-                    surface = pygame.surfarray.make_surface(self.camera_image.swapaxes(0, 1))
-                    self.display.blit(surface, (0, 0))
-                    pygame.display.flip()
+                    # Check if display is still valid (window not minimized)
+                    if pygame.display.get_active():
+                        surface = pygame.surfarray.make_surface(self.camera_image.swapaxes(0, 1))
+                        self.display.blit(surface, (0, 0))
+                        pygame.display.flip()
                     self.clock.tick(60)  # Limit frame rate to 60 FPS
+                except pygame.error as e:
+                    pass  # Window minimized or display issue, continue training
                 except Exception as e:
                     console.log(f"[red]Error during rendering: {e}[/red]")
 
-            # Create a dashboard showing current controls
-            font = pygame.font.SysFont("Arial", 18)
-            speed = getattr(self, 'previous_speed', 0)
-            target_speed = getattr(self, 'target_speed', 11.5)
-
-            speed_color = (0, 255, 0) if target_speed - 2 < speed < target_speed + 2 else (255, 255, 0) if speed > 0 else (255, 0, 0)
-
-            # Get steering and action values safely
-            steering = getattr(self, 'previous_steering', 0.0)
-            throttle = getattr(self, 'previous_throttle', 0.0)
-            brake = getattr(self, 'previous_brake', 0.0)
-
-            # Basic information always available
-            texts = [
-                (f"Speed: {speed:.1f} km/h", speed_color),
-                (f"Reward: {self.last_reward:.1f}", (0, 255, 0) if self.last_reward > 0 else (255, 0, 0)),
-            ]
-
-            # Add episode info
-            episode_text = f"Episode: {self.episode_count}"  # Removed success rate
-            texts.append((episode_text, (255, 255, 255)))
-
-            # Render text on the display
-            for i, (text, color) in enumerate(texts):
-                text_surface = font.render(text, True, color)
-                self.display.blit(text_surface, (10, 10 + i * 25))
-
-            # Reward history graph
-            graph_width = 150
-            graph_height = 50
-            graph_x = self.display_width - graph_width - 20
-            graph_y = 50
-
-            # Background for the graph
-            pygame.draw.rect(self.display, (30, 30, 30), (graph_x, graph_y, graph_width, graph_height))
-
-            # Store last 50 rewards in a circular buffer if needed
-            if not hasattr(self, 'reward_history'):
-                self.reward_history = [0] * 50
-
-            # Update rewards history
-            self.reward_history = self.reward_history[1:] + [self.last_reward]
-
-            # Normalize rewards for display
-            max_r = max(max(self.reward_history), 1)
-            min_r = min(min(self.reward_history), -1)
-            range_r = max(max_r - min_r, 1)
-
-            # Plot rewards
-            for i, r in enumerate(self.reward_history):
-                normalized_r = (r - min_r) / range_r
-                bar_height = int(normalized_r * graph_height)
-                color = (0, 255, 0) if r > 0 else (255, 0, 0)
-                pygame.draw.line(self.display, color, (graph_x + i * 3, graph_y + graph_height), (graph_x + i * 3, graph_y + graph_height - bar_height), 2)
-
-            # Add label for the graph
-            reward_text = font.render("Reward History", True, (255, 255, 255))
-            self.display.blit(reward_text, (graph_x, graph_y - 20))
-
-            # Add steering indicator
-            center_x = self.display_width - 80
-            center_y = self.display_height - 80
-            radius = 30
-            pygame.draw.circle(self.display, (255, 255, 255), (center_x, center_y), radius, 2)
-            indicator_x = center_x + int(self.previous_steering * radius)
-            indicator_y = center_y
-            pygame.draw.circle(self.display, (255, 255, 255), (indicator_x, indicator_y), 5)
-
-            # Add throttle indicator
-            throttle_x = self.display_width - 40
-            throttle_height = 60
-            throttle_width = 10
-            throttle_y = self.display_height - throttle_height - 50
+            # Skip dashboard rendering if window is minimized/inactive
+            if not pygame.display.get_active():
+                return
             
-            # Draw throttle background
-            pygame.draw.rect(self.display, (50, 50, 50), 
-                           (throttle_x, throttle_y, throttle_width, throttle_height))
-            
-            # Draw current throttle level (green bar)
-            current_height = int(self.previous_throttle * throttle_height)
-            if current_height > 0:
-                pygame.draw.rect(self.display, (0, 255, 0),
-                               (throttle_x, throttle_y + throttle_height - current_height,
-                                throttle_width, current_height))
+            # Wrap all dashboard rendering in try-except to prevent blocking
+            try:
+                # Create a dashboard showing current controls
+                font = pygame.font.SysFont("Arial", 18)
+                speed = getattr(self, 'previous_speed', 0)
+                target_speed = getattr(self, 'target_speed', 11.5)
 
-            # Add throttle label
-            throttle_label = font.render(f"T", True, (255, 255, 255))
-            self.display.blit(throttle_label, (throttle_x - 5, throttle_y - 20))
+                speed_color = (0, 255, 0) if target_speed - 2 < speed < target_speed + 2 else (255, 255, 0) if speed > 0 else (255, 0, 0)
 
-            # Add enhanced training progress bar
-            progress_width = 500  # Made much longer
-            progress_height = 10  # Made thinner
-            progress_x = (self.display_width - progress_width) // 2  # Centered horizontally
-            progress_y = self.display_height - 35
-            border_radius = 7  # Added border radius for curved edges
-            
-            # Draw progress bar border (white outline) with rounded corners
-            pygame.draw.rect(self.display, (255, 255, 255), 
-                           (progress_x-2, progress_y-2, progress_width+4, progress_height+4), 
-                           2, border_radius=border_radius)
-            
-            # Create a surface for the background gradient with alpha channel
-            gradient_surface = pygame.Surface((progress_width, progress_height), pygame.SRCALPHA)
-            
-            # Draw gradient progress fill
-            for i in range(progress_width):
-                color_value = 30 + (i / progress_width) * 20
-                pygame.draw.line(gradient_surface, (color_value, color_value, color_value, 255),
-                               (i, 0), (i, progress_height))
-            
-            # Draw the background surface with rounded corners
-            pygame.draw.rect(gradient_surface, (0, 0, 0, 0), 
-                           (0, 0, progress_width, progress_height), 
-                           border_radius=border_radius-2)
-            self.display.blit(gradient_surface, (progress_x, progress_y))
-            
-            # Calculate and draw current progress
-            if self.model is not None and hasattr(self.model, 'num_timesteps') and hasattr(self.model, 'total_timesteps_for_entropy'):
-                progress = min(1.0, self.model.num_timesteps / self.model.total_timesteps_for_entropy)
-                current_width = int(progress * progress_width)
+                # Get steering and action values safely
+                steering = getattr(self, 'previous_steering', 0.0)
+                throttle = getattr(self, 'previous_throttle', 0.0)
+                brake = getattr(self, 'previous_brake', 0.0)
+
+                # Basic information always available
+                texts = [
+                    (f"Speed: {speed:.1f} km/h", speed_color),
+                    (f"Reward: {self.last_reward:.1f}", (0, 255, 0) if self.last_reward > 0 else (255, 0, 0)),
+                ]
+
+                # Add episode info
+                episode_text = f"Episode: {self.episode_count}"  # Removed success rate
+                texts.append((episode_text, (255, 255, 255)))
+
+                # Render text on the display
+                for i, (text, color) in enumerate(texts):
+                    text_surface = font.render(text, True, color)
+                    self.display.blit(text_surface, (10, 10 + i * 25))
+
+                # Reward history graph
+                graph_width = 150
+                graph_height = 50
+                graph_x = self.display_width - graph_width - 20
+                graph_y = 50
+
+                # Background for the graph
+                pygame.draw.rect(self.display, (30, 30, 30), (graph_x, graph_y, graph_width, graph_height))
+
+                # Store last 50 rewards in a circular buffer if needed
+                if not hasattr(self, 'reward_history'):
+                    self.reward_history = [0] * 50
+
+                # Update rewards history
+                self.reward_history = self.reward_history[1:] + [self.last_reward]
+
+                # Normalize rewards for display
+                max_r = max(max(self.reward_history), 1)
+                min_r = min(min(self.reward_history), -1)
+                range_r = max(max_r - min_r, 1)
+
+                # Plot rewards
+                for i, r in enumerate(self.reward_history):
+                    normalized_r = (r - min_r) / range_r
+                    bar_height = int(normalized_r * graph_height)
+                    color = (0, 255, 0) if r > 0 else (255, 0, 0)
+                    pygame.draw.line(self.display, color, (graph_x + i * 3, graph_y + graph_height), (graph_x + i * 3, graph_y + graph_height - bar_height), 2)
+
+                # Add label for the graph
+                reward_text = font.render("Reward History", True, (255, 255, 255))
+                self.display.blit(reward_text, (graph_x, graph_y - 20))
+
+                # Add steering indicator
+                center_x = self.display_width - 80
+                center_y = self.display_height - 80
+                radius = 30
+                pygame.draw.circle(self.display, (255, 255, 255), (center_x, center_y), radius, 2)
+                indicator_x = center_x + int(self.previous_steering * radius)
+                indicator_y = center_y
+                pygame.draw.circle(self.display, (255, 255, 255), (indicator_x, indicator_y), 5)
+
+                # Add throttle indicator
+                throttle_x = self.display_width - 40
+                throttle_height = 60
+                throttle_width = 10
+                throttle_y = self.display_height - throttle_height - 50
                 
-                if current_width > 0:
-                    # Create a surface for the progress gradient with alpha channel
-                    progress_surface = pygame.Surface((current_width, progress_height), pygame.SRCALPHA)
+                # Draw throttle background
+                pygame.draw.rect(self.display, (50, 50, 50), 
+                               (throttle_x, throttle_y, throttle_width, throttle_height))
+                
+                # Draw current throttle level (green bar)
+                current_height = int(self.previous_throttle * throttle_height)
+                if current_height > 0:
+                    pygame.draw.rect(self.display, (0, 255, 0),
+                                   (throttle_x, throttle_y + throttle_height - current_height,
+                                    throttle_width, current_height))
+
+                # Add throttle label
+                throttle_label = font.render(f"T", True, (255, 255, 255))
+                self.display.blit(throttle_label, (throttle_x - 5, throttle_y - 20))
+
+                # Add enhanced training progress bar
+                progress_width = 500  # Made much longer
+                progress_height = 10  # Made thinner
+                progress_x = (self.display_width - progress_width) // 2  # Centered horizontally
+                progress_y = self.display_height - 35
+                border_radius = 7  # Added border radius for curved edges
+                
+                # Draw progress bar border (white outline) with rounded corners
+                pygame.draw.rect(self.display, (255, 255, 255), 
+                               (progress_x-2, progress_y-2, progress_width+4, progress_height+4), 
+                               2, border_radius=border_radius)
+                
+                # Create a surface for the background gradient with alpha channel
+                gradient_surface = pygame.Surface((progress_width, progress_height), pygame.SRCALPHA)
+                
+                # Draw gradient progress fill
+                for i in range(progress_width):
+                    color_value = 30 + (i / progress_width) * 20
+                    pygame.draw.line(gradient_surface, (color_value, color_value, color_value, 255),
+                                   (i, 0), (i, progress_height))
+                
+                # Draw the background surface with rounded corners
+                pygame.draw.rect(gradient_surface, (0, 0, 0, 0), 
+                               (0, 0, progress_width, progress_height), 
+                               border_radius=border_radius-2)
+                self.display.blit(gradient_surface, (progress_x, progress_y))
+                
+                # Calculate and draw current progress
+                if self.model is not None and hasattr(self.model, 'num_timesteps') and hasattr(self.model, 'total_timesteps_for_entropy'):
+                    progress = min(1.0, self.model.num_timesteps / self.model.total_timesteps_for_entropy)
+                    current_width = int(progress * progress_width)
                     
-                    # Draw gradient progress fill
-                    for i in range(current_width):
-                        # Create a gradient from blue to green
-                        blue = max(0, 255 * (1 - i / progress_width))
-                        green = min(255, 255 * (i / progress_width))
-                        pygame.draw.line(progress_surface, (0, green, blue, 255),
-                                       (i, 0), (i, progress_height))
+                    if current_width > 0:
+                        # Create a surface for the progress gradient with alpha channel
+                        progress_surface = pygame.Surface((current_width, progress_height), pygame.SRCALPHA)
+                        
+                        # Draw gradient progress fill
+                        for i in range(current_width):
+                            # Create a gradient from blue to green
+                            blue = max(0, 255 * (1 - i / progress_width))
+                            green = min(255, 255 * (i / progress_width))
+                            pygame.draw.line(progress_surface, (0, green, blue, 255),
+                                           (i, 0), (i, progress_height))
+                        
+                        # Draw the progress surface with rounded corners
+                        if current_width >= border_radius * 2:
+                            pygame.draw.rect(progress_surface, (0, 0, 0, 0), 
+                                           (0, 0, current_width, progress_height), 
+                                           border_radius=border_radius-2)
+                            self.display.blit(progress_surface, (progress_x, progress_y))
                     
-                    # Draw the progress surface with rounded corners
-                    if current_width >= border_radius * 2:
-                        pygame.draw.rect(progress_surface, (0, 0, 0, 0), 
-                                       (0, 0, current_width, progress_height), 
-                                       border_radius=border_radius-2)
-                        self.display.blit(progress_surface, (progress_x, progress_y))
-                
-                # Add progress percentage text with shadow
-                progress_text = f"Training Progress: {progress * 100:.1f}%"
-                font = pygame.font.Font(None, 28)  # Slightly larger font
-                
-                # Center the text above the progress bar
-                text_width = font.size(progress_text)[0]
-                text_x = progress_x + (progress_width - text_width) // 2
-                
-                # Draw text shadow
-                text_shadow = font.render(progress_text, True, (0, 0, 0))
-                self.display.blit(text_shadow, (text_x + 2, progress_y - 25))
-                
-                # Draw main text
-                text_surface = font.render(progress_text, True, (255, 255, 255))
-                self.display.blit(text_surface, (text_x, progress_y - 27))
-                
-                # Add timestep counter below, also centered
-                timestep_text = f"Steps: {self.model.num_timesteps:,}/{self.model.total_timesteps_for_entropy:,}"
-                timestep_width = font.size(timestep_text)[0]
-                timestep_x = progress_x + (progress_width - timestep_width) // 2
-                
-                timestep_shadow = font.render(timestep_text, True, (0, 0, 0))
-                self.display.blit(timestep_shadow, (timestep_x + 2, progress_y + progress_height + 5))
-                
-                timestep_surface = font.render(timestep_text, True, (200, 200, 200))
-                self.display.blit(timestep_surface, (timestep_x, progress_y + progress_height + 3))
+                    # Add progress percentage text with shadow
+                    progress_text = f"Training Progress: {progress * 100:.1f}%"
+                    font = pygame.font.Font(None, 28)  # Slightly larger font
+                    
+                    # Center the text above the progress bar
+                    text_width = font.size(progress_text)[0]
+                    text_x = progress_x + (progress_width - text_width) // 2
+                    
+                    # Draw text shadow
+                    text_shadow = font.render(progress_text, True, (0, 0, 0))
+                    self.display.blit(text_shadow, (text_x + 2, progress_y - 25))
+                    
+                    # Draw main text
+                    text_surface = font.render(progress_text, True, (255, 255, 255))
+                    self.display.blit(text_surface, (text_x, progress_y - 27))
+                    
+                    # Add timestep counter below, also centered
+                    timestep_text = f"Steps: {self.model.num_timesteps:,}/{self.model.total_timesteps_for_entropy:,}"
+                    timestep_width = font.size(timestep_text)[0]
+                    timestep_x = progress_x + (progress_width - timestep_width) // 2
+                    
+                    timestep_shadow = font.render(timestep_text, True, (0, 0, 0))
+                    self.display.blit(timestep_shadow, (timestep_x + 2, progress_y + progress_height + 5))
+                    
+                    timestep_surface = font.render(timestep_text, True, (200, 200, 200))
+                    self.display.blit(timestep_surface, (timestep_x, progress_y + progress_height + 3))
 
-            pygame.display.update()
+                # Update display
+                pygame.display.update()
+            except pygame.error:
+                pass  # Window minimized, skip rendering
+            except Exception as e:
+                pass  # Don't let rendering errors stop training
 
 
 

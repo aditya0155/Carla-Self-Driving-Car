@@ -22,13 +22,9 @@ from rich.console import Console
 
 import optuna
 
-from stable_baselines3.common.logger import configure  
+from stable_baselines3.common.logger import configure
 
-import serial
-import time
-
-# Mixed Precision Training imports
-from torch.cuda.amp import GradScaler, autocast
+# Note: Mixed Precision Training is handled in carla_env.py's CustomSAC class
     
 from carla_env import CarlaEnv, CustomSAC
 
@@ -125,7 +121,8 @@ class CombinedExtractor(BaseFeaturesExtractor):
         # State dimension is read dynamically from observation_space
 
         super(CombinedExtractor, self).__init__(observation_space, features_dim)
-
+        
+        # ========== IMAGE CNN ==========
         self.cnn = nn.Sequential(
 
             nn.Conv2d(3, 64, kernel_size=8, stride=4),
@@ -161,11 +158,26 @@ class CombinedExtractor(BaseFeaturesExtractor):
             dummy_image = torch.zeros(1, 3, 84, 84)
 
             cnn_out_dim = self.cnn(dummy_image).shape[1]
-
         
-
+        # ========== LIDAR BEV CNN ==========
+        # Processes the 64x64 single-channel BEV occupancy grid
+        self.lidar_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, stride=2),    # 64x64 -> 30x30
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2),   # 30x30 -> 14x14
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2),   # 14x14 -> 6x6
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        # Determine LIDAR CNN output dimension
+        with torch.no_grad():
+            dummy_lidar = torch.zeros(1, 1, 64, 64)
+            lidar_cnn_out_dim = self.lidar_cnn(dummy_lidar).shape[1]
+        
+        # ========== STATE MLP ==========
         state_dim = observation_space.spaces["state"].shape[0]  # dynamically determined (currently 5)
-
         # MLP for state with LayerNorm for stability
 
         self.mlp = nn.Sequential(
@@ -180,13 +192,19 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
         )
 
-
-
+        
+        # ========== FUSION LAYERS ==========
         self.attention_layer = nn.Linear(cnn_out_dim, 128)
+        
+        # LIDAR feature projection to match state features
+        self.lidar_projection = nn.Sequential(
+            nn.Linear(lidar_cnn_out_dim, 128),
+            nn.ReLU()
+        )
 
         
-
-        combined_dim = cnn_out_dim + 128
+        # Combined: image_features + state_features + lidar_features
+        combined_dim = cnn_out_dim + 128 + 128  # image + state + lidar
 
         self.fc = nn.Sequential(
 
@@ -241,12 +259,26 @@ class CombinedExtractor(BaseFeaturesExtractor):
             image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
         
         image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
+        
+        # Process LIDAR BEV grid (uint8 [0, 255] -> float [0, 1])
+        lidar_bev = observations["lidar_bev"]
+        if lidar_bev.ndim == 4 and lidar_bev.shape[1] == 1:
+            lidar = lidar_bev.float() / 255.0  # Normalize uint8 to [0, 1]
+        else:
+            lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0  # Convert to [batch, 1, H, W] and normalize
+        
+        lidar_features = self.lidar_cnn(lidar)  # shape: [batch, lidar_cnn_out_dim]
+        lidar_features = self.lidar_projection(lidar_features)  # shape: [batch, 128]
+        
+        # Process state
         state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
         
+        # Attention-weighted fusion (image guides state importance)
         attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
         fused_state = state_features * attn_weights
         
-        concatenated = torch.cat([image_features, fused_state], dim=1)
+        # Concatenate all features: image + state (attention-weighted) + lidar
+        concatenated = torch.cat([image_features, fused_state, lidar_features], dim=1)
 
         concatenated = torch.nan_to_num(concatenated, nan=0.0, posinf=1e3, neginf=-1e3)
         return self.fc(concatenated)
@@ -287,7 +319,8 @@ def make_env():
             camera_width=84,
             camera_height=84,
             model=None,
-            arduino_port=arduino_port
+            arduino_port=arduino_port,
+            rotate_maps=True  # Enable map rotation after each episode
         )
         return env
     return _init

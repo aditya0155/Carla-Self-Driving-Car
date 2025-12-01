@@ -465,9 +465,12 @@ class CarlaEnv(gym.Env):
 
         
         # BEV (Bird's Eye View) Occupancy Grid for LIDAR - MUST be defined before observation_space!
+        # FRONT-FACING configuration: 180° FOV covers right-front-left
+        # Vehicle at bottom center of grid, looking forward (up in grid)
         self.bev_grid_size = 64  # Grid resolution (64x64)
-        self.bev_range = 40.0   # Total range in meters (40m x 40m area)
-        self.bev_resolution = self.bev_range / self.bev_grid_size  # meters per pixel
+        self.bev_forward_range = 25.0  # Forward range in meters (matches LIDAR range)
+        self.bev_lateral_range = 25.0  # Lateral range ±25m (total 50m width)
+        self.bev_resolution = self.bev_forward_range / self.bev_grid_size  # ~0.39m per pixel
 
         # Expand observation space.
 
@@ -1084,26 +1087,27 @@ class CarlaEnv(gym.Env):
 
                 lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
 
-                # LIDAR settings optimized for BEV occupancy grid
-                # BEV grid is 40m x 40m, so we need full 360° coverage
-                lidar_bp.set_attribute('range', '25')  # Reduced: only need 20m + buffer for BEV
+                # LIDAR settings optimized for FRONT-FACING BEV occupancy grid
+                # 180° FOV covers right-front-left which is most important for driving
+                # This gives 2x point density in the relevant area vs 360°
+                lidar_bp.set_attribute('range', '25')  # 25m range for BEV
                 lidar_bp.set_attribute('rotation_frequency', '20')  # Match simulation rate
-                lidar_bp.set_attribute('channels', '32')  # More vertical resolution
-                lidar_bp.set_attribute('points_per_second', '100000')  # 2x denser for better BEV (CPU only, no RAM impact)
+                lidar_bp.set_attribute('channels', '32')  # Vertical resolution
+                lidar_bp.set_attribute('points_per_second', '60000')  # Dense point cloud
                     
-                # FOV settings:
+                # Vertical FOV settings:
                 # At z=1.8m height, lower_fov=-15° hits ground at ~6.7m
                 # This is acceptable - we filter ground in _on_lidar_update()
                 lidar_bp.set_attribute('upper_fov', '10.0')   # Look up for overhead obstacles
-                lidar_bp.set_attribute('lower_fov', '-15.0')  # Slightly more down angle for near obstacles
+                lidar_bp.set_attribute('lower_fov', '-15.0')  # Down angle for near obstacles
                 
-                # CRITICAL: Full 360° for complete BEV coverage
-                # Previous 120° only covered front, leaving sides/rear blind!
-                lidar_bp.set_attribute('horizontal_fov', '360.0')  # Full surround view
+                # HORIZONTAL FOV: 180° front-facing (right 90° + front + left 90°)
+                # Covers the driving-relevant area with higher point density
+                # Rear is not critical - we're not driving backwards
+                lidar_bp.set_attribute('horizontal_fov', '180.0')  # Front semicircle
                 
-                # Position: roof level (z=1.8m) centered on vehicle
-                # x=0 (centered) for symmetric 360° coverage
-                lidar_transform = carla.Transform(carla.Location(x=0.0, z=1.8), carla.Rotation(pitch=0))
+                # Position: roof level (z=1.8m), slightly forward for better front coverage
+                lidar_transform = carla.Transform(carla.Location(x=0.5, z=1.8), carla.Rotation(pitch=0))
 
                 self.lidar_sensor = self.world.spawn_actor(lidar_bp, lidar_transform, attach_to=self.vehicle)
 
@@ -1367,24 +1371,24 @@ class CarlaEnv(gym.Env):
         2. Generate BEV (Bird's Eye View) occupancy grid for spatial awareness
         
         LIDAR Configuration:
-        - Position: roof level (z=1.8m), centered (x=0)
-        - horizontal_fov = 360° (full surround view for BEV)
+        - Position: roof level (z=1.8m), slightly forward (x=0.5)
+        - horizontal_fov = 180° (front semicircle: right-front-left)
         - lower_fov = -15° (hits ground at ~6.7m)
-        - range = 25m (sufficient for 20m BEV radius)
-        - 32 channels, 100k points/sec for dense BEV
+        - range = 25m
+        - 32 channels, 60k points/sec for BEV
         
         Ground Filtering Geometry:
         - Sensor at 1.8m height, lower beam at -15°
         - Ground plane: z_sensor = -1.8m (relative to LIDAR)
         - At distance d, -15° beam z = -d * tan(15°) = -0.268 * d
-        - Simple z > -1.5m filter FAILS for d < 5.6m (ground passes!)
         - Solution: Distance-dependent ground filter
         
-        BEV Grid:
-        - 64x64 pixels covering 40m x 40m area (±20m from car)
-        - Vehicle is at center (grid[32, 32])
-        - Row 0 = 20m ahead (front), Row 63 = 20m behind (back)
-        - Col 0 = 20m right, Col 63 = 20m left
+        BEV Grid (FRONT-FACING SEMICIRCLE):
+        - 64x64 pixels covering 25m forward x 50m wide area
+        - Vehicle is at BOTTOM CENTER of grid (row 63, col 32)
+        - Row 0 = 25m ahead (front), Row 63 = vehicle position
+        - Col 0 = 25m right, Col 63 = 25m left
+        - This gives 2x resolution vs 360° grid for the area that matters!
         - Cell value: 0 = free, 255 = occupied
         """
         points = np.frombuffer(lidar_measurement.raw_data, dtype=np.float32)
@@ -1442,38 +1446,42 @@ class CarlaEnv(gym.Env):
         else:
             self.lidar_min_distance = float('inf')
         
-        # ========== GENERATE BEV OCCUPANCY GRID ==========
+        # ========== GENERATE BEV OCCUPANCY GRID (FRONT-FACING) ==========
         # Reset grid (uint8 for memory efficiency: 60MB vs 240MB in replay buffer)
         bev_grid = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)
         
         # Filter for BEV:
         # - Must pass ground filter and self filter
         # - Upper bound: ignore points > 3m above ground (overhangs, bridges)
+        # - Only keep FORWARD points (x > 0) since we have 180° front FOV
         upper_threshold = 1.2  # Relative to sensor: 1.8 + 1.2 = 3.0m above ground
-        bev_mask = not_self & not_ground & (z < upper_threshold)
+        bev_mask = not_self & not_ground & (z < upper_threshold) & (x > 0)  # Front only
         
         bev_x = x[bev_mask]
         bev_y = y[bev_mask]
         
         if len(bev_x) > 0:
-            # Convert to grid coordinates
-            # Center of grid is vehicle position (grid_size/2, grid_size/2)
-            # x (forward) maps to grid row (0 = back, grid_size-1 = front)
-            # y (left/right) maps to grid col (0 = right, grid_size-1 = left)
+            # Convert to grid coordinates for FRONT-FACING BEV:
+            # - Vehicle is at BOTTOM CENTER (row 63, col 32)
+            # - Row 0 = max range ahead, Row 63 = vehicle position
+            # - Col 0 = max range right, Col 63 = max range left
+            # - Grid covers bev_forward_range forward (x) and ±bev_lateral_range sideways (y)
             
-            half_range = self.bev_range / 2.0
+            # Use instance variables for consistency (set in __init__)
+            max_forward = self.bev_forward_range  # 25m forward range
+            max_lateral = self.bev_lateral_range  # ±25m lateral (50m total width)
             
-            # Normalize coordinates to [-1, 1] range, then to grid indices
-            # Flip x so forward is at the top of the grid
-            grid_row = ((half_range - bev_x) / self.bev_range * self.bev_grid_size).astype(np.int32)
-            grid_col = ((bev_y + half_range) / self.bev_range * self.bev_grid_size).astype(np.int32)
+            # Map x (forward distance) to row: 0m -> row 63, max_forward -> row 0
+            grid_row = ((max_forward - bev_x) / max_forward * (self.bev_grid_size - 1)).astype(np.int32)
+            
+            # Map y (lateral) to column: -max_lateral (right) -> col 0, +max_lateral (left) -> col 63
+            grid_col = ((bev_y + max_lateral) / (2 * max_lateral) * (self.bev_grid_size - 1)).astype(np.int32)
             
             # Clip to valid grid indices
             grid_row = np.clip(grid_row, 0, self.bev_grid_size - 1)
             grid_col = np.clip(grid_col, 0, self.bev_grid_size - 1)
             
             # Mark occupied cells with value 255 (uint8 max)
-            # Direct assignment is more efficient for uint8
             bev_grid[grid_row, grid_col] = 255
         
         self.lidar_bev = bev_grid
@@ -1738,10 +1746,13 @@ class CarlaEnv(gym.Env):
                "lidar_bev": lidar_bev_obs}
         
         # Calculate front occupancy for logging (BEV is observation-only, not used in reward)
+        # In front-facing BEV: row 0-7 = far ahead (22-25m), rows 56-63 = very close (0-3m)
         danger_occ = 0.0
         if hasattr(self, 'lidar_bev') and self.lidar_bev is not None:
             grid_center = self.bev_grid_size // 2
-            danger_zone = self.lidar_bev[0:8, grid_center-6:grid_center+6]
+            # Danger zone: bottom 8 rows (close to vehicle), center 16 columns
+            # Rows 56-63 = closest 3m (25m / 64 * 8 ≈ 3.1m), cols 24-40 = center ±6m
+            danger_zone = self.lidar_bev[56:64, grid_center-8:grid_center+8]
             danger_occ = np.mean(danger_zone) / 255.0
         
         # Log with color based on danger zone occupancy (for monitoring only)

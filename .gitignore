@@ -1,6 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# CUDA compiled files
 *.i
 *.ii
 *.gpu
 *.ptx
 *.cubin
 *.fatbin
+
+# Model checkpoints and saved models
+checkpoints/
+*.zip
+*.pkl
+*.pt
+*.pth
+*.onnx
+
+# TensorBoard logs
+sac_tensorboard/
+logs/
+runs/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Local config
+*.env
+.env.local

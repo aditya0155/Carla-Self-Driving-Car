@@ -62,15 +62,15 @@ class EntropyLoggingCallback(BaseCallback):
 
         if self.n_calls % self.log_interval == 0:
 
-            # Access entropy coefficient (works for both fixed and auto entropy)
+            # Access entropy coefficient (check log_ent_coef FIRST for auto entropy mode)
 
-            if hasattr(self.model, 'ent_coef_tensor'):
-
-                current_ent_coef = self.model.ent_coef_tensor.item()
-
-            elif hasattr(self.model, 'log_ent_coef') and self.model.log_ent_coef is not None:
+            if hasattr(self.model, 'log_ent_coef') and self.model.log_ent_coef is not None:
 
                 current_ent_coef = torch.exp(self.model.log_ent_coef).item()
+
+            elif hasattr(self.model, 'ent_coef_tensor'):
+
+                current_ent_coef = self.model.ent_coef_tensor.item()
 
             else:
 
@@ -234,40 +234,21 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations):
 
-        # Process image with Mixed Precision (FP16) for VRAM efficiency
-
-        with autocast(enabled=torch.cuda.is_available()):
-
-            if observations["image"].ndim == 4 and observations["image"].shape[1] == 3:
-
-                image = observations["image"].float() / 255.0
-
-            else:
-
-                image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
-
-            
-
-            image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
-
-            state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
-
-            
-
-
-
-            attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
-
-            fused_state = state_features * attn_weights
-
+        # Process image (no autocast here - causes dtype issues with fc layer)
+        if observations["image"].ndim == 4 and observations["image"].shape[1] == 3:
+            image = observations["image"].float() / 255.0
+        else:
+            image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
         
-
+        image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
+        state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
+        
+        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
+        fused_state = state_features * attn_weights
+        
         concatenated = torch.cat([image_features, fused_state], dim=1)
 
-
-
         concatenated = torch.nan_to_num(concatenated, nan=0.0, posinf=1e3, neginf=-1e3)
-
         return self.fc(concatenated)
 
 
@@ -367,7 +348,7 @@ def objective(trial):
 
         buffer_size=30000,
 
-        optimize_memory_usage=True,  # Reduces RAM by ~50%
+        # Note: optimize_memory_usage not supported with Dict observation spaces
 
         learning_starts=1000,
 
@@ -565,9 +546,15 @@ if __name__ == "__main__":
 
         
 
-        # Log the current state (use ent_coef_tensor for fixed entropy)
+        # Log the current state (check log_ent_coef first for auto entropy mode)
 
-        current_alpha = model.ent_coef_tensor.item()
+        if hasattr(model, 'log_ent_coef') and model.log_ent_coef is not None:
+
+            current_alpha = torch.exp(model.log_ent_coef).item()
+
+        else:
+
+            current_alpha = model.ent_coef_tensor.item()
 
         console.log(f"[cyan]Current entropy coefficient: {current_alpha:.4f}[/cyan]")
 
@@ -595,9 +582,9 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=30000,
+            buffer_size=15000,  # Reduced from 30000 to save ~600MB RAM
 
-            optimize_memory_usage=True,  # Reduces RAM by ~50% (stores next_obs by reference)
+            # Note: optimize_memory_usage not supported with Dict observation spaces
 
             learning_starts=1000,
 
@@ -617,16 +604,10 @@ if __name__ == "__main__":
 
     callbacks = [checkpoint_callback, loss_logging_callback, stuck_detection_callback, entropy_logging_callback]
 
-
-
-    model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
-
-
-
-    # After model creation, update the environment with the model reference
+    # IMPORTANT: Set model reference BEFORE training so render() can access it
     env.envs[0].model = model
 
-
+    model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
 
     model_path = "sac_carla_model_enhanced"
 

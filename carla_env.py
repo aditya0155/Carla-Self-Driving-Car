@@ -36,27 +36,40 @@ console = Console()
 
 
 class CustomSAC(SAC):
+    """
+    Optimized SAC for CARLA self-driving car task.
+    
+    Key improvements over basic linear decay:
+    1. Uses SB3's automatic entropy tuning (learns optimal alpha)
+    2. Dynamically adjusts target entropy based on training progress
+    3. Applies cosine annealing for smooth decay
+    4. Clamps alpha to prevent runaway values (fixes "entropy keeps rising" bug)
+    5. Supports Mixed Precision Training for efficiency
+    """
 
-    def __init__(self, *args, total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
+    def __init__(self, *args, total_timesteps_for_entropy=150000, use_mixed_precision=True, 
+                 initial_ent_coef=0.2, **kwargs):
 
         kwargs.pop('logger', None)
-
         kwargs.pop('ent_coef', None)  # Remove any ent_coef passed
         
-        # Use fixed entropy (not "auto") - we manage the schedule ourselves
-        # This avoids wasted computation from SAC's entropy optimizer
-        super().__init__(*args, ent_coef=1.0, **kwargs)
+        # Use automatic entropy tuning with specified initial value
+        # "auto_0.2" means: use automatic tuning, starting at alpha=0.2
+        super().__init__(*args, ent_coef=f"auto_{initial_ent_coef}", **kwargs)
 
         
         self.total_timesteps_for_entropy = total_timesteps_for_entropy
-
         self.num_timesteps_at_start = self.num_timesteps
-
-        self.initial_alpha = 1.0
-
-        self.min_alpha = 0.01  
-
-        self.current_alpha = self.initial_alpha
+        
+        # Target entropy scheduling parameters
+        # base_target_entropy is set by SAC to -dim(A) = -3 for 3D action space
+        self.base_target_entropy = self.target_entropy  # Store original (-dim(A))
+        self.initial_target_scale = 0.5  # Start at 50% of default target (less random)
+        self.final_target_scale = 0.1    # End at 10% of default target (very deterministic)
+        
+        # CRITICAL: Alpha clamping bounds to prevent "entropy keeps rising" bug
+        self.min_ent_coef = 0.01  # Never go below this (maintain minimal exploration)
+        self.max_ent_coef = 0.5   # Never go above this (prevent excessive randomness)
         
         # Mixed Precision Training (FP16) - reduces VRAM usage by ~50%
         self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -66,8 +79,43 @@ class CustomSAC(SAC):
         else:
             self.scaler = None
             console.log("[yellow]Mixed Precision disabled (CPU mode or user disabled)[/yellow]")
+        
+        console.log(f"[cyan]Entropy: auto tuning enabled, initial={initial_ent_coef}, "
+                   f"target_entropy={self.base_target_entropy:.3f}, "
+                   f"clamped to [{self.min_ent_coef}, {self.max_ent_coef}][/cyan]")
 
-
+    def _get_target_entropy_scale(self) -> float:
+        """
+        Calculate current target entropy scale using cosine annealing.
+        
+        Cosine annealing provides:
+        - Fast initial decay (quickly learn basic driving)
+        - Slower middle decay (allow exploration of edge cases)  
+        - Fast final decay (converge to optimal policy)
+        """
+        progress = min(1.0, self.num_timesteps / self.total_timesteps_for_entropy)
+        
+        # Cosine annealing: smooth transition from initial to final scale
+        scale = self.final_target_scale + 0.5 * (
+            self.initial_target_scale - self.final_target_scale
+        ) * (1 + np.cos(np.pi * progress))
+        
+        return scale
+    
+    def _clamp_entropy_coef(self):
+        """
+        CRITICAL: Clamp the entropy coefficient to prevent extreme values.
+        This fixes the "entropy keeps rising" bug by enforcing hard bounds.
+        """
+        if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
+            with torch.no_grad():
+                current_alpha = torch.exp(self.log_ent_coef).item()
+                clamped_alpha = np.clip(current_alpha, self.min_ent_coef, self.max_ent_coef)
+                
+                # Only update if significantly different (prevents oscillation)
+                if abs(current_alpha - clamped_alpha) > 0.001:
+                    self.log_ent_coef.data.fill_(np.log(clamped_alpha))
+                    console.log(f"[yellow]Entropy clamped: {current_alpha:.4f} -> {clamped_alpha:.4f}[/yellow]")
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """
@@ -92,6 +140,12 @@ class CustomSAC(SAC):
             next_obs = replay_data.next_observations
             dones = replay_data.dones
             rewards = replay_data.rewards
+            
+            # Get current entropy coefficient (use learned value from log_ent_coef)
+            if self.log_ent_coef is not None:
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+            else:
+                ent_coef = self.ent_coef_tensor
 
             if self.use_mixed_precision:
                 # Mixed Precision forward pass for critic
@@ -103,7 +157,7 @@ class CustomSAC(SAC):
                         next_q_values = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
                         next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
                         # Entropy regularization
-                        next_q_values = next_q_values - self.ent_coef_tensor * next_log_prob.reshape(-1, 1)
+                        next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                         # td error + entropy term
                         target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
@@ -118,6 +172,9 @@ class CustomSAC(SAC):
                 # Optimize the critic with gradient scaling
                 self.critic.optimizer.zero_grad()
                 self.scaler.scale(critic_loss).backward()
+                # Gradient clipping to prevent exploding gradients
+                self.scaler.unscale_(self.critic.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
                 self.scaler.step(self.critic.optimizer)
 
                 # Mixed Precision forward pass for actor
@@ -126,12 +183,23 @@ class CustomSAC(SAC):
                     actions_pi, log_prob = self.actor.action_log_prob(obs)
                     q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
                     min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
-                    actor_loss = (self.ent_coef_tensor * log_prob - min_qf_pi).mean()
+                    actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
 
                 # Optimize the actor with gradient scaling
                 self.actor.optimizer.zero_grad()
                 self.scaler.scale(actor_loss).backward()
+                # Gradient clipping to prevent exploding gradients
+                self.scaler.unscale_(self.actor.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
                 self.scaler.step(self.actor.optimizer)
+                
+                # Update entropy coefficient (if using automatic tuning)
+                if self.ent_coef_optimizer is not None:
+                    with autocast():
+                        ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                    self.ent_coef_optimizer.zero_grad()
+                    self.scaler.scale(ent_coef_loss).backward()
+                    self.scaler.step(self.ent_coef_optimizer)
 
                 # Update the scaler
                 self.scaler.update()
@@ -141,7 +209,7 @@ class CustomSAC(SAC):
                     next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
                     next_q_values = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
                     next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
-                    next_q_values = next_q_values - self.ent_coef_tensor * next_log_prob.reshape(-1, 1)
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                     target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
                 current_q_values = self.critic(obs, actions)
@@ -152,16 +220,27 @@ class CustomSAC(SAC):
 
                 self.critic.optimizer.zero_grad()
                 critic_loss.backward()
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
                 self.critic.optimizer.step()
 
                 actions_pi, log_prob = self.actor.action_log_prob(obs)
                 q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
                 min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
-                actor_loss = (self.ent_coef_tensor * log_prob - min_qf_pi).mean()
+                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
 
                 self.actor.optimizer.zero_grad()
                 actor_loss.backward()
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
                 self.actor.optimizer.step()
+                
+                # Update entropy coefficient (if using automatic tuning)
+                if self.ent_coef_optimizer is not None:
+                    ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                    self.ent_coef_optimizer.zero_grad()
+                    ent_coef_loss.backward()
+                    self.ent_coef_optimizer.step()
 
             # Update target networks
             self._update_target_networks()
@@ -171,6 +250,8 @@ class CustomSAC(SAC):
                 self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
                 self.logger.record("train/actor_loss", actor_loss.item())
                 self.logger.record("train/critic_loss", critic_loss.item())
+                if self.ent_coef_optimizer is not None:
+                    self.logger.record("train/ent_coef_loss", ent_coef_loss.item())
 
     def _update_target_networks(self):
         """Soft update of the target networks"""
@@ -190,65 +271,56 @@ class CustomSAC(SAC):
 
 
     def _update_learning_rate(self, optimizers):
-
-        """Update the entropy coefficient based on training progress"""
-
+        """Update learning rate and entropy scheduling with safeguards."""
         super()._update_learning_rate(optimizers)
-
         
-
-        # Calculate progress based on total timesteps since start
-        total_elapsed = self.num_timesteps
-        progress_fraction = min(1.0, total_elapsed / self.total_timesteps_for_entropy)
+        # 1. Update target entropy based on training progress (cosine annealing)
+        scale = self._get_target_entropy_scale()
+        self.target_entropy = self.base_target_entropy * scale
         
-
-
-        # Linear interpolation between initial_alpha and min_alpha
-        new_alpha = self.initial_alpha * (1.0 - progress_fraction) + self.min_alpha * progress_fraction
-        self.current_alpha = new_alpha
-
-
-
-        # Update the fixed entropy coefficient tensor (not log_ent_coef since we use fixed ent_coef)
-        self.ent_coef_tensor = torch.tensor(new_alpha, device=self.device)
-
-
-
+        # 2. CRITICAL: Clamp entropy coefficient to prevent runaway values
+        self._clamp_entropy_coef()
+        
+        # 3. Get current alpha for logging
+        if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
+            current_alpha = torch.exp(self.log_ent_coef).item()
+        else:
+            current_alpha = self.ent_coef_tensor.item()
+        
+        # 4. Logging
         if self.logger is not None:
-            self.logger.record("train/entropy_coefficient", new_alpha)
-            
-
-
+            self.logger.record("train/entropy_coefficient", current_alpha)
+            self.logger.record("train/target_entropy", self.target_entropy)
+            self.logger.record("train/target_entropy_scale", scale)
+        
+        # 5. Debug output
         if self.num_timesteps % 1000 == 0:
-            print(f"[DEBUG] timesteps: {self.num_timesteps}, progress: {progress_fraction:.4f}, entropy_coef: {new_alpha:.4f}")
+            progress = self.num_timesteps / self.total_timesteps_for_entropy
+            print(f"[ENTROPY] timesteps: {self.num_timesteps}, "
+                  f"progress: {progress:.2%}, "
+                  f"alpha: {current_alpha:.4f} (clamped to [{self.min_ent_coef}, {self.max_ent_coef}]), "
+                  f"target_H: {self.target_entropy:.3f}")
 
     
 
     @classmethod
-
-    def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
-
+    def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, 
+             total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
         """
-
-        Load the model from a zip-file with Mixed Precision support.
-
+        Load the model from a zip-file with proper entropy configuration restoration.
         """
-
         model = super(CustomSAC, cls).load(path, env, device, custom_objects, **kwargs)
         
-
         # Set the total_timesteps_for_entropy
         model.total_timesteps_for_entropy = total_timesteps_for_entropy
+        model.num_timesteps_at_start = model.num_timesteps  # Initialize for learn() method
         
-
-        # Get current entropy from the fixed tensor (not log_ent_coef since we use fixed ent_coef)
-        current_alpha = model.ent_coef_tensor.item()
-        
-
-        # Set the initial alpha to maintain the current trajectory
-        model.initial_alpha = current_alpha
-        model.current_alpha = current_alpha
-        model.min_alpha = 0.01
+        # Restore entropy bounds and target entropy configuration
+        model.min_ent_coef = 0.01
+        model.max_ent_coef = 0.5
+        model.initial_target_scale = 0.5
+        model.final_target_scale = 0.1
+        model.base_target_entropy = model.target_entropy
         
         # Setup Mixed Precision Training for resumed model
         model.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -258,8 +330,14 @@ class CustomSAC(SAC):
         else:
             model.scaler = None
         
+        # Get current alpha for logging
+        if hasattr(model, 'log_ent_coef') and model.log_ent_coef is not None:
+            current_alpha = torch.exp(model.log_ent_coef).item()
+        else:
+            current_alpha = model.ent_coef_tensor.item()
+        
         print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}/{model.total_timesteps_for_entropy}, "
-              f"entropy_coefficient: {current_alpha:.4f}")
+              f"entropy_coef: {current_alpha:.4f}, target_entropy: {model.target_entropy:.3f}")
 
         
 
@@ -578,7 +656,10 @@ class CarlaEnv(gym.Env):
         self.previous_steering = 0.0
         self.previous_throttle = 0.0
         self.previous_brake = 0.0
+        self.previous_acceleration = 0.0  # Reset to prevent jerk calculation errors
         self.last_reward = 0.0
+        self.lidar_min_distance = float('inf')  # Reset LIDAR to prevent stale data
+        self.collision_history = False  # Reset collision flag for new episode
 
         resources_to_cleanup = []
         
@@ -940,7 +1021,7 @@ class CarlaEnv(gym.Env):
             resources_to_cleanup = []
             
 
-            return {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8),
+            return {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
                     "state": state}
 
@@ -984,7 +1065,7 @@ class CarlaEnv(gym.Env):
 
             default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
 
-            return {"image": np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8),
+            return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
                     "state": default_state}
 
@@ -1054,7 +1135,12 @@ class CarlaEnv(gym.Env):
         """
         Normalize state values to approximately [-1, 1] range for better neural network training.
         Uses z-score normalization: (x - mean) / std
+        
+        IMPORTANT: Clamps infinite LIDAR values to max range (50m) to prevent NaN in neural network.
         """
+        # Clamp LIDAR distance (index 4) to max range of 50m to prevent inf
+        state = state.copy()
+        state[4] = min(state[4], 50.0)  # LIDAR max range is 50m
         return (state - self.state_mean) / (self.state_std + 1e-8)
 
 
@@ -1106,8 +1192,7 @@ class CarlaEnv(gym.Env):
     def _send_arduino_data(self, speed, reward, steering, throttle, brake):
         """Send data to Arduino for LCD and LEDs"""
         if self.arduino is None:
-            console.log("[red]Arduino connection not established[/red]")
-            return
+            return  # Silently skip if Arduino not connected
 
         try:
             # Format: "S{speed}R{reward}C{controls}"
@@ -1140,7 +1225,15 @@ class CarlaEnv(gym.Env):
     def step(self, action):
 
         steering, throttle, brake = action
-        self.previous_steering = steering  # Store the steering value
+        
+        # Safety check: if vehicle is None (e.g., after a failed reset), return early
+        if self.vehicle is None:
+            console.log("[red][STEP] Vehicle is None! Returning dummy observation.[/red]")
+            default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
+            return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
+                    "state": default_state}, -100.0, True, {"error": "vehicle_none"}
+        
+        # NOTE: previous_steering is updated AFTER reward calculation to compute steering change
         control = carla.VehicleControl(
 
             steer=float(steering),
@@ -1172,6 +1265,7 @@ class CarlaEnv(gym.Env):
         speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
 
         dt = self.frame_skip * self.world.get_settings().fixed_delta_seconds
+        dt = max(dt, 1e-6)  # Protect against division by zero
 
 
 
@@ -1337,13 +1431,13 @@ class CarlaEnv(gym.Env):
 
         self.previous_speed = speed
 
-
+        self.previous_steering = steering  # Update AFTER reward calculation for proper steering change detection
 
         # Store throttle and brake as instance variables
         self.previous_throttle = throttle  # Store for rendering
         self.previous_brake = brake  # Store for rendering
 
-        obs = {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8),
+        obs = {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
 
                "state": state}
         if self.lidar_min_distance < 2.0:
@@ -1366,13 +1460,10 @@ class CarlaEnv(gym.Env):
         if self.collision_history:
             done = True
         
-        if self.stuck_counter >= stuck_max_steps:
-            console.log("[red][STUCK] Vehicle is stuck. Respawning vehicle.[/red]")
-            obs = self.reset()
-            return obs, -20, True, {"stuck": True}
+        # Note: stuck_counter >= stuck_max_steps is already handled above with early return
 
         if done:  # Now done is properly defined before being used
-            self.episode_count += 1
+            # Note: episode_count is incremented in reset(), not here (to avoid double-counting)
             # Update success rate based on your criteria
             self.success_rate = self.success_rate * 0.95 + (0 if self.collision_history else 100) * 0.05
 
@@ -1522,7 +1613,7 @@ class CarlaEnv(gym.Env):
             self.display.blit(gradient_surface, (progress_x, progress_y))
             
             # Calculate and draw current progress
-            if hasattr(self.model, 'num_timesteps') and hasattr(self.model, 'total_timesteps_for_entropy'):
+            if self.model is not None and hasattr(self.model, 'num_timesteps') and hasattr(self.model, 'total_timesteps_for_entropy'):
                 progress = min(1.0, self.model.num_timesteps / self.model.total_timesteps_for_entropy)
                 current_width = int(progress * progress_width)
                 

@@ -311,16 +311,22 @@ def make_env():
             
         console.log(f"[green]Using Arduino port: {arduino_port}[/green]")
         
+        # ========== PERFORMANCE TIP ==========
+        # Set no_rendering_mode=True to disable CARLA's main viewport rendering
+        # This gives 2-3x faster training and ELIMINATES the minimized window slowdown!
+        # Sensors (camera, LIDAR) still work normally - only spectator view is disabled
+        # Set to False if you want to watch the CARLA 3D viewport during training
         env = CarlaEnv(
             num_npcs=5, 
             frame_skip=8, 
-            visualize=True,
+            visualize=True,  # This is pygame window (your dashboard)
             fixed_delta_seconds=0.05,
             camera_width=84,
             camera_height=84,
             model=None,
             arduino_port=arduino_port,
-            rotate_maps=False  # Disabled: only 1 map available, enable when more maps downloaded
+            rotate_maps=False,  # Disabled: only 1 map available, enable when more maps downloaded
+            no_rendering_mode=True  # HUGE SPEEDUP: Disable CARLA viewport (fixes minimize slowdown!)
         )
         return env
     return _init

@@ -148,24 +148,31 @@ class CustomSAC(SAC):
                 ent_coef = self.ent_coef_tensor
 
             if self.use_mixed_precision:
-                # Mixed Precision forward pass for critic
-                with autocast(device_type='cuda'):
-                    with torch.no_grad():
-                        # Select action according to policy
-                        next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
+                # CRITICAL: Actor action sampling MUST be in FP32 to avoid NaN in Normal distribution
+                # The Normal distribution's validate_args check fails with FP16 due to precision issues
+                # Only use autocast for critic forward passes (Q-value computation)
+                
+                with torch.no_grad():
+                    # Select action according to policy (FP32 - no autocast!)
+                    next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
+                    
+                    # Mixed precision for Q-value computation only
+                    with autocast(device_type='cuda'):
                         # Compute the next Q values
                         next_q_values = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
                         next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
-                        # Entropy regularization
-                        next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                        # Entropy regularization (cast to FP32 for stability)
+                        next_q_values = next_q_values.float() - ent_coef * next_log_prob.reshape(-1, 1)
                         # td error + entropy term
                         target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
+                # Mixed Precision for critic loss computation
+                with autocast(device_type='cuda'):
                     # Get current Q estimates for each critic
                     current_q_values = self.critic(obs, actions)
                     # Compute critic loss
                     critic_loss = 0.5 * sum(
-                        torch.nn.functional.mse_loss(current_q, target_q_values) 
+                        torch.nn.functional.mse_loss(current_q, target_q_values.float()) 
                         for current_q in current_q_values
                     )
 
@@ -177,13 +184,14 @@ class CustomSAC(SAC):
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
                 self.scaler.step(self.critic.optimizer)
 
-                # Mixed Precision forward pass for actor
+                # Actor loss computation (FP32 for action sampling, autocast for Q-values)
+                actions_pi, log_prob = self.actor.action_log_prob(obs)  # FP32 - no autocast!
+                
                 with autocast(device_type='cuda'):
-                    # Compute actor loss
-                    actions_pi, log_prob = self.actor.action_log_prob(obs)
                     q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
                     min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
-                    actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+                    # Cast to FP32 for actor loss to maintain precision
+                    actor_loss = (ent_coef * log_prob - min_qf_pi.float()).mean()
 
                 # Optimize the actor with gradient scaling
                 self.actor.optimizer.zero_grad()
@@ -195,8 +203,8 @@ class CustomSAC(SAC):
                 
                 # Update entropy coefficient (if using automatic tuning)
                 if self.ent_coef_optimizer is not None:
-                    with autocast(device_type='cuda'):
-                        ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                    # Entropy loss in FP32 for stability
+                    ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                     self.ent_coef_optimizer.zero_grad()
                     self.scaler.scale(ent_coef_loss).backward()
                     self.scaler.step(self.ent_coef_optimizer)

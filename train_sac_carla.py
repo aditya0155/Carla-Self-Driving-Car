@@ -379,7 +379,7 @@ def objective(trial):
 
         learning_rate=lr,
 
-        buffer_size=30000,
+        buffer_size=22000,
 
         # Note: optimize_memory_usage not supported with Dict observation spaces
 

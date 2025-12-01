@@ -1089,8 +1089,8 @@ class CarlaEnv(gym.Env):
                 lidar_bp.set_attribute('range', '25')  # Reduced: only need 20m + buffer for BEV
                 lidar_bp.set_attribute('rotation_frequency', '20')  # Match simulation rate
                 lidar_bp.set_attribute('channels', '32')  # More vertical resolution
-                lidar_bp.set_attribute('points_per_second', '100000')  # Dense point cloud for BEV
-                
+                lidar_bp.set_attribute('points_per_second', '100000')  # 2x denser for better BEV (CPU only, no RAM impact)
+                    
                 # FOV settings:
                 # At z=1.8m height, lower_fov=-15° hits ground at ~6.7m
                 # This is acceptable - we filter ground in _on_lidar_update()
@@ -1699,92 +1699,13 @@ class CarlaEnv(gym.Env):
 
             imu_penalty = 0.0
 
-        # Enhanced LIDAR reward using BEV occupancy grid instead of just minimum distance
-        # Analyze the BEV grid for spatial awareness
-        lidar_penalty = 0.0  # Initialize to 0 (CRITICAL: was missing before!)
-        
-        if hasattr(self, 'lidar_bev') and self.lidar_bev is not None:
-            bev = self.lidar_bev  # 64x64 uint8 grid
-            grid_center = self.bev_grid_size // 2  # 32
-            
-            # BEV Grid Coordinate System:
-            # - Row 0 = 20m AHEAD of car (front)
-            # - Row 32 = car position (center)
-            # - Row 63 = 20m BEHIND car (back)
-            # - Col 0 = 20m RIGHT of car
-            # - Col 32 = car center
-            # - Col 63 = 20m LEFT of car
-            
-            # Define regions of interest (corrected coordinates!)
-            # Front region: 0-20m ahead (rows 0-32), centered columns ±6m
-            front_cols_start = grid_center - 10  # ~6m right
-            front_cols_end = grid_center + 10    # ~6m left
-            front_region = bev[0:grid_center, front_cols_start:front_cols_end]
-            
-            # Close front region: 0-10m immediately ahead (rows 0-16, car-width columns)
-            close_front = bev[0:16, grid_center-8:grid_center+8]
-            
-            # Very close danger zone: 0-5m ahead (rows 0-8)
-            danger_zone = bev[0:8, grid_center-6:grid_center+6]
-            
-            # Left region: to the left of car (cols 42-63, rows near car)
-            # Now with 360° LIDAR, this region actually has data!
-            left_region = bev[grid_center-12:grid_center+12, grid_center+10:]
-            
-            # Right region: to the right of car (cols 0-22, rows near car)  
-            right_region = bev[grid_center-12:grid_center+12, 0:grid_center-10]
-            
-            # Rear region: behind the car (rows 48-63, centered columns)
-            # Important for reversing and situational awareness
-            rear_region = bev[grid_center+16:, grid_center-10:grid_center+10]
-            
-            # Calculate occupancy percentages (255 = occupied, 0 = free)
-            front_occupancy = np.mean(front_region) / 255.0  # 0-1 scale
-            close_front_occupancy = np.mean(close_front) / 255.0
-            danger_zone_occupancy = np.mean(danger_zone) / 255.0
-            left_occupancy = np.mean(left_region) / 255.0
-            right_occupancy = np.mean(right_region) / 255.0
-            rear_occupancy = np.mean(rear_region) / 255.0
-            
-            # ========== DISTANCE-WEIGHTED PENALTY SYSTEM ==========
-            # Based on physics: stopping distance at 30km/h ≈ 9m, at 50km/h ≈ 25m
-            
-            # Danger zone (0-5m): CRITICAL - immediate collision risk
-            # Max penalty when fully occupied: -25 * 1.0 = -25
-            danger_penalty = -danger_zone_occupancy * 25.0
-            
-            # Close front (0-10m): HIGH - reaction time zone
-            # Max penalty: -10 * 1.0 = -10
-            close_penalty = -close_front_occupancy * 10.0
-            
-            # Front (0-20m): MODERATE - planning horizon  
-            # Max penalty: -4 * 1.0 = -4
-            front_penalty = -front_occupancy * 4.0
-            
-            # Side obstacles: LIGHT - lane awareness (now with real data from 360° LIDAR!)
-            # Max penalty: -3 * (1.0 + 1.0) = -6
-            side_penalty = -(left_occupancy + right_occupancy) * 3.0
-            
-            # Rear obstacles: VERY LIGHT - only matters when reversing
-            # Max penalty: -1 * 1.0 = -1
-            rear_penalty = -rear_occupancy * 1.0
-            
-            # Total spatial awareness penalty
-            lidar_penalty = danger_penalty + close_penalty + front_penalty + side_penalty + rear_penalty
-            
-            # ========== BONUS FOR CLEAR PATH ==========
-            # Encourage the agent to find and maintain open driving corridors
-            if danger_zone_occupancy < 0.005 and close_front_occupancy < 0.01 and front_occupancy < 0.03:
-                lidar_penalty += 2.5  # Strong bonus for completely clear front
-            elif danger_zone_occupancy < 0.02 and close_front_occupancy < 0.05:
-                lidar_penalty += 1.0  # Moderate bonus for mostly clear
-            elif danger_zone_occupancy < 0.05:
-                lidar_penalty += 0.3  # Small bonus for acceptable clearance
-        
-        # Fallback to minimum distance if BEV not available
-        elif self.lidar_min_distance < 2.0:
-            lidar_penalty = - (2.0 - self.lidar_min_distance) * 10.0
-        # else: lidar_penalty remains 0.0 (initialized above)
+        # LIDAR BEV is used as observation input to the CNN (CombinedExtractor) only.
+        # We removed occupancy-based reward shaping to let the policy learn end-to-end
+        # what BEV patterns matter for safe driving. This avoids:
+        # - Coupling sensor noise/artifacts into reward signal
+        # - Hand-tuned penalties that may not generalize across maps
+        # - Reward hacking where agent exploits sensor quirks
+        # The collision penalty (-27) provides the main safety signal.
 
 
 
@@ -1794,7 +1715,7 @@ class CarlaEnv(gym.Env):
 
                   energy_penalty*0.001 + energy_bonus + collision_penalty +
 
-                  lane_invasion_penalty + imu_penalty*0.9 + lidar_penalty*0.9 - self.idle_penalty + stuck_penalty) * 2.0
+                  lane_invasion_penalty + imu_penalty*0.9 - self.idle_penalty + stuck_penalty) * 2.0
 
 
 
@@ -1816,17 +1737,17 @@ class CarlaEnv(gym.Env):
                "state": state,
                "lidar_bev": lidar_bev_obs}
         
-        # Calculate front occupancy for logging
+        # Calculate front occupancy for logging (BEV is observation-only, not used in reward)
         danger_occ = 0.0
         if hasattr(self, 'lidar_bev') and self.lidar_bev is not None:
             grid_center = self.bev_grid_size // 2
             danger_zone = self.lidar_bev[0:8, grid_center-6:grid_center+6]
             danger_occ = np.mean(danger_zone) / 255.0
         
-        # Log with color based on danger zone occupancy
+        # Log with color based on danger zone occupancy (for monitoring only)
         log_color = "red" if danger_occ > 0.05 else "yellow" if danger_occ > 0.01 else "blue"
         console.log(f"[{log_color}][STEP] Loc=({current_location.x:.2f},{current_location.y:.2f}), "
-                    f"Speed={speed:.2f}, DangerZone={danger_occ:.1%}, LidarPen={lidar_penalty:.1f}, "
+                    f"Speed={speed:.2f}, BEV_DangerZone={danger_occ:.1%}, "
                     f"Reward={reward:.2f}[/{log_color}]")
         if self.visualize:
             self.render()

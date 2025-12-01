@@ -56,14 +56,13 @@ class CustomSAC(SAC):
 
         kwargs.pop('logger', None)
 
-        if 'ent_coef' in kwargs:
-
-            del kwargs['ent_coef']
-
-        super().__init__(*args, ent_coef="auto", **kwargs)
+        kwargs.pop('ent_coef', None)  # Remove any ent_coef passed
+        
+        # Use fixed entropy (not "auto") - we manage the schedule ourselves
+        # This avoids wasted computation from SAC's entropy optimizer
+        super().__init__(*args, ent_coef=1.0, **kwargs)
 
         
-
         self.total_timesteps_for_entropy = total_timesteps_for_entropy
 
         self.num_timesteps_at_start = self.num_timesteps
@@ -108,9 +107,8 @@ class CustomSAC(SAC):
 
 
 
-        # Update the entropy coefficient
-        with torch.no_grad():
-            self.log_ent_coef.copy_(torch.log(torch.tensor([new_alpha], device=self.device)))
+        # Update the fixed entropy coefficient tensor (not log_ent_coef since we use fixed ent_coef)
+        self.ent_coef_tensor = torch.tensor(new_alpha, device=self.device)
 
 
 
@@ -141,8 +139,8 @@ class CustomSAC(SAC):
         model.total_timesteps_for_entropy = total_timesteps_for_entropy
         
 
-        with torch.no_grad():
-            current_alpha = torch.exp(model.log_ent_coef).item()
+        # Get current entropy from the fixed tensor (not log_ent_coef since we use fixed ent_coef)
+        current_alpha = model.ent_coef_tensor.item()
         
 
         # Set the initial alpha to maintain the current trajectory

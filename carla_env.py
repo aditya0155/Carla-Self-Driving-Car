@@ -16,35 +16,19 @@ import cv2
 
 import time
 
-from rich.console import Console
-
 import math
 
 import torch
 
-from stable_baselines3 import SAC
-
 import serial
+
+from rich.console import Console
+
+from stable_baselines3 import SAC
 
 
 
 console = Console()
-
-
-
-import math
-
-import torch
-
-from stable_baselines3 import SAC
-
-
-
-import torch
-
-import math
-
-from stable_baselines3 import SAC
 
 
 
@@ -369,6 +353,14 @@ class CarlaEnv(gym.Env):
         self.reward_history = [0] * 50  # Initialize reward history
 
         self.success_rate = 0.0  # Initialize success rate
+
+        # State normalization parameters (for normalizing state to ~[-1, 1] range)
+        # These are approximate ranges based on typical CARLA values
+        self.state_mean = np.array([0.0, 0.0, 10.0, 0.0, 25.0], dtype=np.float32)  # [x, y, speed, yaw, lidar]
+        self.state_std = np.array([200.0, 200.0, 15.0, 180.0, 25.0], dtype=np.float32)  # Std dev for normalization
+        
+        # Image augmentation flag (enabled during training for robustness)
+        self.use_augmentation = True
 
         self.spawn_npcs()
 
@@ -809,6 +801,12 @@ class CarlaEnv(gym.Env):
 
             ], dtype=np.float32)
 
+            
+
+            # Normalize the state for better neural network training
+
+            state = self._normalize_state(state)
+
 
 
             console.log(f"[green][RESET] Agent spawned at {transform.location} using a small vehicle[/green]")
@@ -856,9 +854,9 @@ class CarlaEnv(gym.Env):
 
             
 
-            # Return a blank observation
+            # Return a blank observation (normalized zero state)
 
-            default_state = np.zeros(5, dtype=np.float32)
+            default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
 
             return {"image": np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8),
 
@@ -877,7 +875,11 @@ class CarlaEnv(gym.Env):
         rgb_image = cv2.cvtColor(array, cv2.COLOR_BGRA2RGB)
 
         resized = cv2.resize(rgb_image, (self.camera_width, self.camera_height))
-
+        
+        # Apply augmentation during training for robustness
+        if self.use_augmentation and random.random() < 0.3:  # 30% chance of augmentation
+            resized = self._augment_image(resized)
+        
         self.camera_image_obs = resized.astype(np.uint8)
 
         # Use the full-resolution RGB image for rendering to maintain consistency.
@@ -889,6 +891,45 @@ class CarlaEnv(gym.Env):
         else:
 
             self.camera_image = resized
+
+    def _augment_image(self, image):
+        """
+        Apply random augmentations to the image for training robustness.
+        This helps the model generalize to different lighting/weather conditions.
+        """
+        augmented = image.copy()
+        
+        # Random brightness adjustment (simulates different times of day)
+        if random.random() < 0.5:
+            brightness_factor = random.uniform(0.7, 1.3)
+            augmented = np.clip(augmented * brightness_factor, 0, 255).astype(np.uint8)
+        
+        # Random contrast adjustment
+        if random.random() < 0.3:
+            contrast_factor = random.uniform(0.8, 1.2)
+            mean = np.mean(augmented, axis=(0, 1), keepdims=True)
+            augmented = np.clip((augmented - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
+        
+        # Random color jitter (slight hue shift)
+        if random.random() < 0.2:
+            # Convert to HSV, shift hue slightly, convert back
+            hsv = cv2.cvtColor(augmented, cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-10, 10)) % 180
+            augmented = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        
+        # Random Gaussian noise (simulates sensor noise)
+        if random.random() < 0.2:
+            noise = np.random.normal(0, 5, augmented.shape).astype(np.float32)
+            augmented = np.clip(augmented.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        
+        return augmented
+
+    def _normalize_state(self, state):
+        """
+        Normalize state values to approximately [-1, 1] range for better neural network training.
+        Uses z-score normalization: (x - mean) / std
+        """
+        return (state - self.state_mean) / (self.state_std + 1e-8)
 
 
 
@@ -1075,6 +1116,12 @@ class CarlaEnv(gym.Env):
             self.lidar_min_distance
 
         ], dtype=np.float32)
+
+        
+
+        # Normalize the state for better neural network training
+
+        state = self._normalize_state(state)
 
 
 

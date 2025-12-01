@@ -59,11 +59,21 @@ class EntropyLoggingCallback(BaseCallback):
 
         if self.n_calls % self.log_interval == 0:
 
-            # Directly access the entropy coefficient from the model.
+            # Access entropy coefficient (works for both fixed and auto entropy)
 
-            current_ent_coef = torch.exp(self.model.log_ent_coef).item()
+            if hasattr(self.model, 'ent_coef_tensor'):
 
-            print(f"[INFO] Step {self.n_calls}: Entropy Coefficient = {current_ent_coef}")
+                current_ent_coef = self.model.ent_coef_tensor.item()
+
+            elif hasattr(self.model, 'log_ent_coef') and self.model.log_ent_coef is not None:
+
+                current_ent_coef = torch.exp(self.model.log_ent_coef).item()
+
+            else:
+
+                current_ent_coef = 0.0
+
+            print(f"[INFO] Step {self.n_calls}: Entropy Coefficient = {current_ent_coef:.4f}")
 
         return True
 
@@ -79,9 +89,13 @@ class ResidualBlock(nn.Module):
 
         super(ResidualBlock, self).__init__()
 
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
 
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+
+        self.bn2 = nn.BatchNorm2d(channels)
 
         self.relu = nn.ReLU(inplace=True)
 
@@ -91,9 +105,9 @@ class ResidualBlock(nn.Module):
 
         residual = x
 
-        out = self.relu(self.conv1(x))
+        out = self.relu(self.bn1(self.conv1(x)))
 
-        out = self.conv2(out)
+        out = self.bn2(self.conv2(out))
 
         return self.relu(out + residual)
 
@@ -105,7 +119,7 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 1024):
 
-        # Expect state to be 8-dim now.
+        # State dimension is read dynamically from observation_space
 
         super(CombinedExtractor, self).__init__(observation_space, features_dim)
 
@@ -147,9 +161,9 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
         
 
-        state_dim = observation_space.spaces["state"].shape[0]  # now 8
+        state_dim = observation_space.spaces["state"].shape[0]  # dynamically determined (currently 5)
 
-        # MLP for state.
+        # MLP for state with LayerNorm for stability
 
         self.mlp = nn.Sequential(
 
@@ -180,6 +194,38 @@ class CombinedExtractor(BaseFeaturesExtractor):
         )
 
         self._features_dim = features_dim
+
+        
+
+        # Initialize weights using Kaiming/He initialization (best practice for ReLU networks)
+
+        self._initialize_weights()
+
+    
+
+    def _initialize_weights(self):
+
+        for m in self.modules():
+
+            if isinstance(m, nn.Conv2d):
+
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+                if m.bias is not None:
+
+                    nn.init.constant_(m.bias, 0)
+
+            elif isinstance(m, nn.BatchNorm2d):
+
+                nn.init.constant_(m.weight, 1)
+
+                nn.init.constant_(m.bias, 0)
+
+            elif isinstance(m, nn.Linear):
+
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+                nn.init.constant_(m.bias, 0)
 
 
 
@@ -512,11 +558,9 @@ if __name__ == "__main__":
 
         
 
-        # Log the current state
+        # Log the current state (use ent_coef_tensor for fixed entropy)
 
-        with torch.no_grad():
-
-            current_alpha = torch.exp(model.log_ent_coef).item()
+        current_alpha = model.ent_coef_tensor.item()
 
         console.log(f"[cyan]Current entropy coefficient: {current_alpha:.4f}[/cyan]")
 

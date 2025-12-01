@@ -320,7 +320,7 @@ def make_env():
             camera_height=84,
             model=None,
             arduino_port=arduino_port,
-            rotate_maps=True  # Enable map rotation after each episode
+            rotate_maps=False  # Disabled: only 1 map available, enable when more maps downloaded
         )
         return env
     return _init

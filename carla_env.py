@@ -591,27 +591,29 @@ class CarlaEnv(gym.Env):
     def _get_available_maps(self):
         """
         Get list of available maps from CARLA server.
-        Filters to only include standard Town maps (excludes layered _Opt versions).
+        Filters to include only valid, loadable Town maps.
         """
         try:
             all_maps = self.client.get_available_maps()
             console.log(f"[cyan][MAP DETECTION] All available maps from CARLA: {all_maps}[/cyan]")
             
-            # Filter to get only standard Town maps (Town01-Town10), exclude _Opt layered versions
-            standard_maps = [
+            # Only include Town maps (they are the reliable, well-tested maps)
+            # Mine_01 and other custom maps often have issues
+            # Accept both regular Town and Town_Opt variants
+            usable_maps = [
                 m for m in all_maps 
-                if 'Town' in m and '_Opt' not in m and 'Template' not in m
+                if 'Town' in m and 'Template' not in m
             ]
-            # Sort by town number for consistent ordering
-            standard_maps.sort()
+            # Sort for consistent ordering
+            usable_maps.sort()
             
-            if not standard_maps:
-                console.log("[yellow]No standard Town maps found, using current map only[/yellow]")
+            if not usable_maps:
+                console.log("[yellow]No Town maps found, map rotation disabled[/yellow]")
                 current_map = self.world.get_map().name
                 return [current_map]
             
-            console.log(f"[green][MAP DETECTION] Filtered standard maps: {standard_maps}[/green]")
-            return standard_maps
+            console.log(f"[green][MAP DETECTION] Usable Town maps: {usable_maps}[/green]")
+            return usable_maps
         except Exception as e:
             console.log(f"[red]Error getting available maps: {e}[/red]")
             import traceback

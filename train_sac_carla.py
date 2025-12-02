@@ -351,11 +351,11 @@ class CustomCheckpointCallback(CheckpointCallback):
 
 def objective(trial):
 
-    lr = 2e-4
+    lr = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
 
-    batch_size = trial.suggest_categorical('batch_size', [512])
+    batch_size = trial.suggest_categorical('batch_size', [256, 512])
 
-    tau = 0.002191
+    tau = trial.suggest_float('tau', 0.001, 0.01)
 
     
 
@@ -371,7 +371,7 @@ def objective(trial):
 
     env = DummyVecEnv([make_env() for _ in range(1)])
 
-    model = SAC(
+    model = CustomSAC(
 
         "MultiInputPolicy",
 
@@ -395,9 +395,9 @@ def objective(trial):
 
         tau=tau,
 
-        ent_coef=0.5,  # Fixed entropy coefficient during optimization
+        policy_kwargs=policy_kwargs,
 
-        policy_kwargs=policy_kwargs
+        total_timesteps_for_entropy=10000
 
     )
 
@@ -646,7 +646,16 @@ if __name__ == "__main__":
     # IMPORTANT: Set model reference BEFORE training so render() can access it
     env.envs[0].model = model
 
-    model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
+    # When resuming, use remaining timesteps and don't reset the counter
+    if args.resume is not None and os.path.exists(args.resume):
+        remaining_timesteps = args.total_timesteps - model.num_timesteps
+        if remaining_timesteps <= 0:
+            console.log(f"[yellow]Model already trained for {model.num_timesteps} steps (target: {args.total_timesteps}). Nothing to do.[/yellow]")
+        else:
+            console.log(f"[cyan]Resuming training for {remaining_timesteps} more steps...[/cyan]")
+            model.learn(total_timesteps=remaining_timesteps, callback=callbacks, reset_num_timesteps=False)
+    else:
+        model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
 
     model_path = "sac_carla_model_enhanced"
 

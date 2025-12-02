@@ -360,8 +360,11 @@ class CarlaEnv(gym.Env):
     def __init__(self, num_npcs=5, frame_skip=8, visualize=True,
 
                  fixed_delta_seconds=0.05, camera_width=84, camera_height=84, model=None, 
-                 arduino_port='/dev/ttyACM0', rotate_maps=True):
+                 arduino_port='/dev/ttyACM0', rotate_maps=True, no_rendering_mode=False):
 
+        # Store no_rendering_mode setting (applied after CARLA connection)
+        self._no_rendering_mode = no_rendering_mode
+        
         # Add Arduino serial communication setup
         try:
             self.arduino = serial.Serial(arduino_port, 9600, timeout=1)
@@ -465,7 +468,13 @@ class CarlaEnv(gym.Env):
             settings.synchronous_mode = True
 
         settings.fixed_delta_seconds = fixed_delta_seconds
-
+        
+        # Enable no_rendering_mode for faster training (disables CARLA viewport rendering)
+        # Sensors (camera, LIDAR) still work - only the spectator/viewport is disabled
+        if self._no_rendering_mode:
+            settings.no_rendering_mode = True
+            console.log("[green]No-rendering mode enabled - 2-3x faster training![/green]")
+        
         self.world.apply_settings(settings)
 
         console.log(f"[green]Synchronous mode enabled (fixed_delta_seconds = {fixed_delta_seconds})[/green]")
@@ -662,6 +671,9 @@ class CarlaEnv(gym.Env):
                 console.log(f"[yellow][MAP CHANGE] Sync mode was reset! Re-enabling...[/yellow]")
             settings.synchronous_mode = True
             settings.fixed_delta_seconds = self.fixed_delta_seconds
+            # Preserve no_rendering_mode setting
+            if self._no_rendering_mode:
+                settings.no_rendering_mode = True
             self.world.apply_settings(settings)
             
             # Tick more times to fully stabilize the new world (increased from 5)
@@ -857,6 +869,8 @@ class CarlaEnv(gym.Env):
         self.lidar_min_distance = float('inf')  # Reset LIDAR to prevent stale data
         self.lidar_bev = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)  # Reset BEV grid
         self.collision_history = False  # Reset collision flag for new episode
+        self.camera_image_obs = None  # Reset camera image to prevent stale data
+        self.camera_image = None  # Reset display image as well
 
         resources_to_cleanup = []
         
@@ -1215,7 +1229,19 @@ class CarlaEnv(gym.Env):
 
             state = self._normalize_state(state)
 
-
+            # Wait for camera to produce first image (max 20 additional ticks)
+            # This prevents returning stale/None images after reset
+            wait_ticks = 0
+            while self.camera_image_obs is None and wait_ticks < 20:
+                try:
+                    self.world.tick()
+                    wait_ticks += 1
+                except Exception as e:
+                    console.log(f"[yellow]Error waiting for camera: {e}[/yellow]")
+                    break
+            
+            if self.camera_image_obs is None:
+                console.log("[yellow][RESET] Camera image not ready, using blank image[/yellow]")
 
             console.log(f"[green][RESET] Agent spawned at {transform.location} using a small vehicle[/green]")
             # Clear the resources_to_cleanup list since we're successful

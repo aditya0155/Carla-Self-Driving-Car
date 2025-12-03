@@ -279,13 +279,17 @@ class CustomSAC(SAC):
         Return parameters that should be excluded from being saved.
         
         GradScaler contains _thread.RLock which cannot be pickled.
-        We exclude it and recreate it on load.
+        The env contains CARLA client, pygame display, etc. which also can't be pickled.
+        We exclude them and recreate/reconnect on load.
         """
         excluded = set(super()._excluded_save_params())
         # Add our custom non-picklable attributes
         # GradScaler has thread locks that can't be pickled
         excluded.add("scaler")
         excluded.add("use_mixed_precision")  # Simple bool, recreated on load
+        # Environment contains unpicklable CARLA/pygame objects
+        excluded.add("env")
+        excluded.add("_vec_normalize_env")
         return excluded
 
     def _get_torch_save_params(self):
@@ -1774,7 +1778,7 @@ class CarlaEnv(gym.Env):
 
         if abs(jerk) > jerk_threshold:
 
-            jerk_penalty = -0.0005 * (abs(jerk) - jerk_threshold)
+            jerk_penalty = -0.005 * (abs(jerk) - jerk_threshold)
 
         else:
 
@@ -1786,9 +1790,9 @@ class CarlaEnv(gym.Env):
 
         energy_bonus = 0.2 if abs(speed - target_speed) < 1.0 and throttle < 0.7 else 0.0
 
-        collision_penalty = -27.0 if self.collision_history else 0.0
+        collision_penalty = -50.0 if self.collision_history else 0.0
 
-        lane_invasion_penalty = -14 if self.lane_invasion_history else 0.0
+        lane_invasion_penalty = -18 if self.lane_invasion_history else 0.0
 
         self.lane_invasion_history = False
 

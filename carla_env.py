@@ -63,7 +63,12 @@ class CustomSAC(SAC):
         
         # Target entropy scheduling parameters
         # base_target_entropy is set by SAC to -dim(A) = -3 for 3D action space
-        self.base_target_entropy = self.target_entropy  # Store original (-dim(A))
+        # Note: During load(), target_entropy may still be "auto" string, so we handle that
+        if isinstance(self.target_entropy, (int, float)):
+            self.base_target_entropy = float(self.target_entropy)
+        else:
+            # Will be set properly after model is fully loaded
+            self.base_target_entropy = -3.0  # Default for 3D action space
         self.initial_target_scale = 0.5  # Start at 50% of default target (less random)
         self.final_target_scale = 0.1    # End at 10% of default target (very deterministic)
         
@@ -328,7 +333,13 @@ class CustomSAC(SAC):
         model.max_ent_coef = 0.5
         model.initial_target_scale = 0.5
         model.final_target_scale = 0.1
-        model.base_target_entropy = model.target_entropy
+        
+        # Handle target_entropy - it should be a float after loading, but check to be safe
+        if isinstance(model.target_entropy, (int, float)):
+            model.base_target_entropy = float(model.target_entropy)
+        else:
+            # Default for 3D action space if somehow still a string
+            model.base_target_entropy = -3.0
         
         # Setup Mixed Precision Training for resumed model
         model.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -345,7 +356,7 @@ class CustomSAC(SAC):
             current_alpha = model.ent_coef_tensor.item()
         
         print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}/{model.total_timesteps_for_entropy}, "
-              f"entropy_coef: {current_alpha:.4f}, target_entropy: {model.target_entropy:.3f}")
+              f"entropy_coef: {current_alpha:.4f}, target_entropy: {model.base_target_entropy:.3f}")
 
         
 
@@ -1604,6 +1615,9 @@ class CarlaEnv(gym.Env):
 
 
         # --- Stuck Detection ---
+        # Stricter stuck detection: speed < 2 m/s for 10 seconds triggers respawn
+        # With frame_skip=8 and fixed_delta_seconds=0.05, each step = 0.4s
+        # 10 seconds = 25 steps
 
         dx = current_location.x - self.previous_location.x
 
@@ -1611,11 +1625,11 @@ class CarlaEnv(gym.Env):
 
         distance_moved = np.sqrt(dx**2 + dy**2)
 
-        stuck_speed_threshold = 0.7
+        stuck_speed_threshold = 2.0  # m/s - stricter threshold (was 0.7)
 
-        stuck_move_threshold = 0.6
+        stuck_move_threshold = 0.8   # meters per step
 
-        stuck_max_steps = 50
+        stuck_max_steps = 25         # ~10 seconds (was 50 steps)
 
         if speed < stuck_speed_threshold and distance_moved < stuck_move_threshold:
 
@@ -1631,7 +1645,7 @@ class CarlaEnv(gym.Env):
 
         if self.stuck_counter >= stuck_max_steps:
 
-            console.log("[red][STUCK] Vehicle is stuck. Respawning vehicle.[/red]")
+            console.log("[red][STUCK] Vehicle is stuck (speed < 2 m/s for 10s). Respawning vehicle.[/red]")
 
             obs = self.reset()
 

@@ -292,6 +292,28 @@ class CustomSAC(SAC):
         excluded.add("_vec_normalize_env")
         return excluded
 
+    def save(self, path, exclude=None, include=None):
+        """
+        Save the model to a zip file, handling unpicklable CARLA environment.
+        
+        Temporarily removes the env reference before saving, then restores it.
+        """
+        # Store reference to env
+        env_backup = self.env
+        vec_normalize_backup = getattr(self, '_vec_normalize_env', None)
+        
+        # Temporarily remove unpicklable objects
+        self.env = None
+        self._vec_normalize_env = None
+        
+        try:
+            # Call parent save
+            super().save(path, exclude=exclude, include=include)
+        finally:
+            # Restore env reference
+            self.env = env_backup
+            self._vec_normalize_env = vec_normalize_backup
+
     def _get_torch_save_params(self):
         """
         Get the name of torch variables that will be saved with PyTorch's ``th.save``.

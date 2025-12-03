@@ -41,14 +41,19 @@ class CustomSAC(SAC):
     "Soft Actor-Critic: Off-Policy Maximum Entropy Deep RL with a Stochastic Actor"
     (Haarnoja et al., 2018)
     
-    Key principles from the paper:
+    Key principles from the paper (Section 4.2 & Appendix D):
     1. Target entropy H̄ = -dim(A) is FIXED (not decayed over time)
     2. α (entropy coefficient) is LEARNED to satisfy: E[-log π(a|s)] ≥ H̄
-    3. α automatically decreases as policy becomes more confident
-    4. No timestep-based scheduling - purely adaptive!
+    3. α automatically adjusts as policy becomes more/less confident
+    4. NO BOUNDS ON α - the paper does not clamp alpha!
     
-    Additional safety features (not in paper):
-    - Alpha clamping to prevent extreme values
+    From paper Table 1 (Appendix D):
+    - Learning rate: 3×10⁻⁴
+    - Target smoothing (τ): 0.005
+    - Network: 2 hidden layers, 256 units each
+    - No alpha clamping mentioned
+    
+    Additional feature (not in paper):
     - Mixed Precision Training for efficiency
     """
 
@@ -69,9 +74,9 @@ class CustomSAC(SAC):
         else:
             self.fixed_target_entropy = -3.0  # Default for 3D action space
         
-        # Safety bounds for α (not in original paper, but prevents instability)
-        self.min_ent_coef = 0.005  # Minimum exploration
-        self.max_ent_coef = 1.0    # Maximum exploration
+        # NO ALPHA BOUNDS - Paper does not clamp α (Table 1, Appendix D)
+        # α is learned freely via gradient descent on the entropy loss
+        # This allows the algorithm to find the optimal exploration-exploitation balance
         
         # Mixed Precision Training (FP16) - reduces VRAM usage
         self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -85,21 +90,7 @@ class CustomSAC(SAC):
         console.log(f"[cyan]SAC (Paper Implementation):[/cyan]")
         console.log(f"[cyan]  - Target entropy H̄ = {self.fixed_target_entropy:.3f} (FIXED, = -dim(A))[/cyan]")
         console.log(f"[cyan]  - α is learned automatically to match H̄[/cyan]")
-        console.log(f"[cyan]  - α bounds: [{self.min_ent_coef}, {self.max_ent_coef}][/cyan]")
-
-    def _clamp_entropy_coef(self):
-        """
-        Safety clamp for α to prevent extreme values.
-        Not in original paper, but prevents training instability.
-        """
-        if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
-            with torch.no_grad():
-                current_alpha = torch.exp(self.log_ent_coef).item()
-                clamped_alpha = np.clip(current_alpha, self.min_ent_coef, self.max_ent_coef)
-                
-                if abs(current_alpha - clamped_alpha) > 0.001:
-                    self.log_ent_coef.data.fill_(np.log(clamped_alpha))
-                    console.log(f"[yellow]α clamped: {current_alpha:.4f} → {clamped_alpha:.4f}[/yellow]")
+        console.log(f"[cyan]  - α bounds: None (free, as per paper)[/cyan]")
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """
@@ -261,11 +252,11 @@ class CustomSAC(SAC):
 
 
     def _update_learning_rate(self, optimizers):
-        """Update learning rate with safety clamping for α."""
+        """Update learning rate. No alpha clamping - follows paper exactly."""
         super()._update_learning_rate(optimizers)
         
-        # Safety clamp α (not in paper, but prevents instability)
-        self._clamp_entropy_coef()
+        # NO ALPHA CLAMPING - Paper does not clamp α (Table 1, Appendix D)
+        # α is learned freely via gradient descent on the entropy loss
         
         # Get current α for logging
         if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
@@ -281,7 +272,7 @@ class CustomSAC(SAC):
         # Debug output every 1000 steps
         if self.num_timesteps % 1000 == 0:
             print(f"[SAC] step: {self.num_timesteps}, α: {current_alpha:.4f}, "
-                  f"target_H: {self.fixed_target_entropy:.3f} (fixed)")
+                  f"target_H: {self.fixed_target_entropy:.3f} (fixed, no clamp)")
 
     
 
@@ -291,19 +282,17 @@ class CustomSAC(SAC):
         """
         Load the model from a zip-file.
         
-        Follows original SAC paper:
+        Follows original SAC paper exactly:
         - Fixed target entropy H̄ = -dim(A) = -3.0
-        - Safety clamps on α ∈ [0.01, 0.5]
+        - NO alpha clamping (α learned freely via gradient descent)
         """
         model = super(CustomSAC, cls).load(path, env, device, custom_objects, **kwargs)
         
         # Fixed target entropy from paper: H̄ = -dim(A)
         model.fixed_target_entropy = -3.0
         
-        # Safety clamp bounds (not in paper, but prevents instability)
-        # Match the bounds from __init__
-        model.min_ent_coef = 0.005
-        model.max_ent_coef = 1.0
+        # NO ALPHA BOUNDS - Paper does not clamp α (Table 1, Appendix D)
+        # α is learned freely via gradient descent on the entropy loss
         
         # Setup Mixed Precision Training for resumed model
         model.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -320,9 +309,7 @@ class CustomSAC(SAC):
             current_alpha = model.ent_coef_tensor.item()
         
         print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}, "
-              f"α: {current_alpha:.4f}, target_H: {model.fixed_target_entropy:.3f} (fixed)")
-
-        
+              f"α: {current_alpha:.4f}, target_H: {model.fixed_target_entropy:.3f} (fixed, no clamp)")
 
         return model    
 
@@ -334,7 +321,7 @@ class CarlaEnv(gym.Env):
 
     def __init__(self, num_npcs=5, frame_skip=8, visualize=True,
 
-                 fixed_delta_seconds=0.05, camera_width=160, camera_height=120, model=None, 
+                 fixed_delta_seconds=0.05, camera_width=84, camera_height=84, model=None, 
                  arduino_port='/dev/ttyACM0', rotate_maps=True, no_rendering_mode=False):
 
         # Store no_rendering_mode setting (applied after CARLA connection)
@@ -465,9 +452,9 @@ class CarlaEnv(gym.Env):
         self.bev_resolution = self.bev_forward_range / self.bev_grid_size  # ~0.39m per pixel
 
         # Expand observation space.
-        # GRAYSCALE IMAGE: 160x120x1 for better lane visibility with less memory than RGB
-        # Memory: 160*120*1 = 19,200 bytes vs 84*84*3 = 21,168 bytes (9% savings!)
-        # Resolution: 3.6x more pixels for detecting lane markings
+        # GRAYSCALE IMAGE: 84x84x1 - standard RL vision size for efficiency
+        # Memory: 84*84*1 = 7,056 bytes (very efficient!)
+        # Grayscale preserves edge information for lane detection
 
         self.observation_space = spaces.Dict({
 

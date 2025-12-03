@@ -525,7 +525,7 @@ def objective(trial):
 
         learning_rate=lr,
 
-        buffer_size=30000,
+        buffer_size=50000,
 
         # Note: optimize_memory_usage not supported with Dict observation spaces
 
@@ -756,7 +756,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=30000,  # Reduced from 30000 to save ~600MB RAM
+            buffer_size=50000,  # Reduced from 30000 to save ~600MB RAM
 
             # Note: optimize_memory_usage not supported with Dict observation spaces
 

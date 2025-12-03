@@ -311,44 +311,43 @@ class CustomSAC(SAC):
         if path.suffix == "":
             path = path.with_suffix(".zip")
         
+        # Convert train_freq to simple tuple (it's a TrainFreq namedtuple)
+        if hasattr(self.train_freq, '_asdict'):
+            train_freq_data = (self.train_freq.frequency, self.train_freq.unit.value)
+        else:
+            train_freq_data = self.train_freq
+        
         # WHITELIST: Only save these specific, known-safe parameters
         # These are the essential hyperparameters needed to reconstruct the model
+        # IMPORTANT: Only primitive types (int, float, str, tuple, list, dict of primitives)
         safe_data = {
-            # Core algorithm params
-            "gamma": self.gamma,
-            "tau": self.tau,
-            "learning_rate": self.learning_rate,
-            "buffer_size": self.buffer_size,
-            "batch_size": self.batch_size,
-            "learning_starts": self.learning_starts,
-            "train_freq": self.train_freq,
-            "gradient_steps": self.gradient_steps,
+            # Core algorithm params (all primitives)
+            "gamma": float(self.gamma),
+            "tau": float(self.tau),
+            "learning_rate": float(self.learning_rate) if isinstance(self.learning_rate, (int, float)) else 3e-4,
+            "buffer_size": int(self.buffer_size),
+            "batch_size": int(self.batch_size),
+            "learning_starts": int(self.learning_starts),
+            "train_freq": train_freq_data,
+            "gradient_steps": int(self.gradient_steps),
             "ent_coef": "auto",  # We use auto entropy
-            "target_update_interval": self.target_update_interval,
-            "target_entropy": getattr(self, 'target_entropy', 'auto'),
+            "target_update_interval": int(self.target_update_interval),
+            "target_entropy": float(self.target_entropy) if isinstance(self.target_entropy, (int, float)) else "auto",
             
-            # Spaces (these are picklable gym spaces)
-            "observation_space": self.observation_space,
-            "action_space": self.action_space,
-            
-            # Training state
-            "n_envs": self.n_envs,
-            "num_timesteps": self.num_timesteps,
-            "_total_timesteps": self._total_timesteps,
-            "_num_timesteps_at_start": getattr(self, '_num_timesteps_at_start', 0),
-            "_n_updates": self._n_updates,
-            "_episode_num": self._episode_num,
-            
-            # Policy config
-            "policy_class": self.policy_class,
-            "policy_kwargs": self.policy_kwargs if self.policy_kwargs else {},
+            # Training state (all primitives)
+            "n_envs": int(self.n_envs),
+            "num_timesteps": int(self.num_timesteps),
+            "_total_timesteps": int(self._total_timesteps),
+            "_num_timesteps_at_start": int(getattr(self, '_num_timesteps_at_start', 0)),
+            "_n_updates": int(self._n_updates),
+            "_episode_num": int(self._episode_num),
             
             # Device (as string)
             "device": str(self.device),
             
-            # Custom SAC params
-            "fixed_target_entropy": getattr(self, 'fixed_target_entropy', -3.0),
-            "use_mixed_precision": getattr(self, 'use_mixed_precision', True),
+            # Custom SAC params (primitives)
+            "fixed_target_entropy": float(getattr(self, 'fixed_target_entropy', -3.0)),
+            "use_mixed_precision": bool(getattr(self, 'use_mixed_precision', True)),
         }
         
         # Get neural network params to save via PyTorch
@@ -395,30 +394,39 @@ class CustomSAC(SAC):
         
         path = pathlib.Path(path)
         
+        # Calculate actual buffer size first
+        actual_size = self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size
+        
+        # Safety check: don't save empty buffer
+        if actual_size == 0:
+            console.log(f"[yellow]Replay buffer is empty, skipping save[/yellow]")
+            return None
+        
         # Get buffer data to save
         # We save the internal arrays directly for efficiency
+        # Use .copy() to avoid saving views that might cause issues
         buffer_data = {
             'pos': self.replay_buffer.pos,
             'full': self.replay_buffer.full,
             'buffer_size': self.replay_buffer.buffer_size,
             'observations': {},
             'next_observations': {},
-            'actions': self.replay_buffer.actions[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
-            'rewards': self.replay_buffer.rewards[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
-            'dones': self.replay_buffer.dones[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
+            'actions': self.replay_buffer.actions[:actual_size].copy(),
+            'rewards': self.replay_buffer.rewards[:actual_size].copy(),
+            'dones': self.replay_buffer.dones[:actual_size].copy(),
         }
         
         # Save observations (Dict observation space)
-        actual_size = self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size
         for key in self.replay_buffer.observations.keys():
-            buffer_data['observations'][key] = self.replay_buffer.observations[key][:actual_size]
-            buffer_data['next_observations'][key] = self.replay_buffer.next_observations[key][:actual_size]
+            buffer_data['observations'][key] = self.replay_buffer.observations[key][:actual_size].copy()
+            buffer_data['next_observations'][key] = self.replay_buffer.next_observations[key][:actual_size].copy()
         
         # Calculate size for logging
         total_transitions = actual_size
         
         if use_compression:
-            save_path = path.with_suffix('.pkl.xz')
+            # Use string concatenation for .pkl.xz since pathlib doesn't handle double extensions well
+            save_path = pathlib.Path(str(path) + '.pkl.xz')
             console.log(f"[cyan]Saving replay buffer ({total_transitions:,} transitions) with LZMA compression...[/cyan]")
             with lzma.open(save_path, 'wb', preset=3) as f:  # preset=3 is good balance of speed/compression
                 pickle.dump(buffer_data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -449,16 +457,21 @@ class CustomSAC(SAC):
         path = pathlib.Path(path)
         
         # Try both compressed and uncompressed paths
+        # NOTE: Use string concatenation for double extensions (.pkl.xz)
+        # because pathlib's with_suffix() only handles single extensions
         if path.suffix == '.xz':
             compressed_path = path
-            uncompressed_path = path.with_suffix('')
+            # Remove .xz to get .pkl path (if it was .pkl.xz -> .pkl)
+            uncompressed_path = pathlib.Path(str(path)[:-3])  # Remove '.xz'
         elif path.suffix == '.pkl':
+            # Path is .pkl, compressed would be .pkl.xz
             compressed_path = pathlib.Path(str(path) + '.xz')
             uncompressed_path = path
         else:
-            # Assume it's a base path, try both extensions
-            compressed_path = path.with_suffix('.pkl.xz')
-            uncompressed_path = path.with_suffix('.pkl')
+            # Assume it's a base path (no extension), try both
+            # Use string concatenation to handle double extension correctly
+            compressed_path = pathlib.Path(str(path) + '.pkl.xz')
+            uncompressed_path = pathlib.Path(str(path) + '.pkl')
         
         # Try compressed first (preferred), then uncompressed
         load_path = None
@@ -485,19 +498,34 @@ class CustomSAC(SAC):
                     buffer_data = pickle.load(f)
             
             # Restore buffer state
-            actual_size = buffer_data['pos'] if not buffer_data['full'] else buffer_data['buffer_size']
+            # actual_size = number of valid transitions in the saved buffer
+            saved_pos = buffer_data['pos']
+            saved_full = buffer_data['full']
+            saved_buffer_size = buffer_data['buffer_size']
+            
+            # Calculate how many transitions were in the saved buffer
+            if saved_full:
+                actual_size = saved_buffer_size  # Buffer was full, all slots used
+            else:
+                actual_size = saved_pos  # Buffer not full, pos = number of transitions
             
             # Check if buffer sizes match
-            if buffer_data['buffer_size'] != self.replay_buffer.buffer_size:
-                console.log(f"[yellow]Buffer size mismatch: saved={buffer_data['buffer_size']}, current={self.replay_buffer.buffer_size}[/yellow]")
-                console.log(f"[yellow]Loading {min(actual_size, self.replay_buffer.buffer_size)} transitions[/yellow]")
-                actual_size = min(actual_size, self.replay_buffer.buffer_size)
+            if saved_buffer_size != self.replay_buffer.buffer_size:
+                console.log(f"[yellow]Buffer size mismatch: saved={saved_buffer_size}, current={self.replay_buffer.buffer_size}[/yellow]")
+                # Can only load up to the smaller of the two
+                load_size = min(actual_size, self.replay_buffer.buffer_size)
+                console.log(f"[yellow]Loading {load_size:,} of {actual_size:,} transitions[/yellow]")
+                
+                # If we're loading fewer than we have, just load linearly
+                actual_size = load_size
+                self.replay_buffer.pos = actual_size % self.replay_buffer.buffer_size
+                self.replay_buffer.full = (actual_size >= self.replay_buffer.buffer_size)
+            else:
+                # Buffer sizes match - restore exact state (pos and full flag)
+                self.replay_buffer.pos = saved_pos
+                self.replay_buffer.full = saved_full
             
-            # Restore data
-            self.replay_buffer.pos = actual_size % self.replay_buffer.buffer_size
-            self.replay_buffer.full = buffer_data['full'] and (actual_size >= self.replay_buffer.buffer_size)
-            
-            # Restore arrays
+            # Restore arrays (only up to actual_size)
             self.replay_buffer.actions[:actual_size] = buffer_data['actions'][:actual_size]
             self.replay_buffer.rewards[:actual_size] = buffer_data['rewards'][:actual_size]
             self.replay_buffer.dones[:actual_size] = buffer_data['dones'][:actual_size]
@@ -850,6 +878,13 @@ class CarlaEnv(gym.Env):
         
         # Image augmentation flag (enabled during training for robustness)
         self.use_augmentation = True
+
+        # Image logging settings - save every CNN observation image
+        self.image_log_dir = r"C:\Users\adity\Videos\carla\Carla-Self-Driving-Car\image_log"
+        self.step_counter = 0  # Global step counter for image naming
+        # Create image log directory if it doesn't exist
+        os.makedirs(self.image_log_dir, exist_ok=True)
+        console.log(f"[green]Image logging enabled: {self.image_log_dir}[/green]")
 
         self.spawn_npcs()
 
@@ -2030,9 +2065,9 @@ class CarlaEnv(gym.Env):
 
         energy_bonus = 0.2 if abs(speed - target_speed) < 1.0 and throttle < 0.7 else 0.0
 
-        collision_penalty = -50.0 if self.collision_history else 0.0
+        collision_penalty = -47.0 if self.collision_history else 0.0
 
-        lane_invasion_penalty = -18 if self.lane_invasion_history else 0.0
+        lane_invasion_penalty = -23 if self.lane_invasion_history else 0.0
 
         self.lane_invasion_history = False
 

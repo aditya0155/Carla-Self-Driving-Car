@@ -139,25 +139,88 @@ class ReplayBufferCheckpointCallback(BaseCallback):
     The replay buffer is saved with LZMA compression to reduce file size
     from ~3-4 GB to ~1-1.5 GB.
     
+    Automatically cleans up old checkpoints, keeping only the last N (default: 3).
+    This prevents disk space from filling up with large replay buffer files.
+    
     Args:
         save_freq: How often to save (default: 10000 steps)
         save_path: Directory to save checkpoints
         name_prefix: Prefix for checkpoint files
+        keep_last_n: Number of checkpoints to keep (default: 3)
         verbose: Verbosity level
     """
     
     def __init__(self, save_freq: int = 10000, save_path: str = './checkpoints/', 
-                 name_prefix: str = 'sac_carla', verbose: int = 1):
+                 name_prefix: str = 'sac_carla', keep_last_n: int = 3, verbose: int = 1):
         super().__init__(verbose)
         self.save_freq = save_freq
         self.save_path = save_path
         self.name_prefix = name_prefix
+        self.keep_last_n = keep_last_n
         self.last_save_step = 0
+        self.saved_checkpoints = []  # Track saved checkpoint steps for cleanup
     
     def _init_callback(self) -> None:
         # Create save directory if it doesn't exist
         if self.save_path is not None:
             os.makedirs(self.save_path, exist_ok=True)
+        
+        # Scan for existing checkpoints to populate saved_checkpoints list
+        self._scan_existing_checkpoints()
+    
+    def _scan_existing_checkpoints(self) -> None:
+        """Scan checkpoint directory for existing checkpoints."""
+        import re
+        import glob
+        
+        # Pattern to match checkpoint files: sac_carla_12345_steps.zip
+        pattern = os.path.join(self.save_path, f"{self.name_prefix}_*_steps.zip")
+        existing_files = glob.glob(pattern)
+        
+        # Extract step numbers from filenames
+        step_pattern = re.compile(rf"{re.escape(self.name_prefix)}_(\d+)_steps\.zip")
+        steps = []
+        for filepath in existing_files:
+            filename = os.path.basename(filepath)
+            match = step_pattern.match(filename)
+            if match:
+                steps.append(int(match.group(1)))
+        
+        # Sort and store
+        self.saved_checkpoints = sorted(steps)
+        if self.saved_checkpoints and self.verbose > 0:
+            console.log(f"[cyan]Found {len(self.saved_checkpoints)} existing checkpoints: {self.saved_checkpoints}[/cyan]")
+    
+    def _cleanup_old_checkpoints(self) -> None:
+        """Remove old checkpoints, keeping only the last N."""
+        if len(self.saved_checkpoints) <= self.keep_last_n:
+            return
+        
+        # Checkpoints to remove (oldest ones)
+        to_remove = self.saved_checkpoints[:-self.keep_last_n]
+        
+        for step in to_remove:
+            # Remove model checkpoint (.zip)
+            model_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
+            # Remove replay buffer checkpoint (.pkl.xz)
+            buffer_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps_replay_buffer.pkl.xz")
+            # Also try uncompressed buffer path (.pkl)
+            buffer_path_uncompressed = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps_replay_buffer.pkl")
+            
+            removed_files = []
+            for path in [model_path, buffer_path, buffer_path_uncompressed]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        removed_files.append(os.path.basename(path))
+                    except Exception as e:
+                        console.log(f"[yellow]Warning: Could not remove {path}: {e}[/yellow]")
+            
+            if removed_files and self.verbose > 0:
+                console.log(f"[yellow]Cleaned up old checkpoint (step {step:,}): {', '.join(removed_files)}[/yellow]")
+        
+        # Update the list
+        self.saved_checkpoints = self.saved_checkpoints[-self.keep_last_n:]
     
     def _on_step(self) -> bool:
         # Only save at save_freq intervals
@@ -181,10 +244,18 @@ class ReplayBufferCheckpointCallback(BaseCallback):
             if hasattr(self.model, 'save_replay_buffer'):
                 try:
                     self.model.save_replay_buffer(replay_buffer_path, use_compression=True)
+                    
+                    # Track this checkpoint
+                    self.saved_checkpoints.append(self.num_timesteps)
+                    
                     if self.verbose > 0:
                         console.log(f"[bold green]Full checkpoint saved at step {self.num_timesteps:,}[/bold green]")
                         console.log(f"[green]  Model: {checkpoint_path}.zip[/green]")
                         console.log(f"[green]  Replay Buffer: {replay_buffer_path}.pkl.xz[/green]")
+                    
+                    # Cleanup old checkpoints (keep last N)
+                    self._cleanup_old_checkpoints()
+                    
                 except Exception as e:
                     console.log(f"[red]Error saving replay buffer: {e}[/red]")
             else:
@@ -571,16 +642,17 @@ def make_env():
         # Sensors (camera, LIDAR) still work normally - only spectator view is disabled
         # Set to False if you want to watch the CARLA 3D viewport during training
         # 
-        # GRAYSCALE 84x84: Standard RL vision size for efficiency
-        # - 84x84x1 = 7,056 bytes (very memory efficient!)
+        # GRAYSCALE 128x128: Higher resolution for better visual detail
+        # - 128x128x1 = 16,384 bytes (2.3x more pixels than 84x84)
         # - Grayscale preserves edge information (lane lines are high contrast)
+        # - Compensated by reducing batch_size (512→256) and buffer (50k→35k)
         env = CarlaEnv(
             num_npcs=5, 
             frame_skip=8, 
             visualize=True,  # This is pygame window (your dashboard)
             fixed_delta_seconds=0.05,
-            camera_width=84,    # Standard RL vision size
-            camera_height=84,   # Square 84x84 for efficiency
+            camera_width=128,    # Higher resolution for better detail
+            camera_height=128,   # Square 128x128 (power of 2 for CNNs)
             model=None,
             arduino_port=arduino_port,
             rotate_maps=False,  # Disabled: only 1 map available, enable when more maps downloaded
@@ -728,7 +800,7 @@ if __name__ == "__main__":
 
         learning_rate = 3e-4  # Initial LR (will decay to 1.5e-4 via FixedScheduleLRCallback)
 
-        batch_size = 512
+        batch_size = 256  # Reduced from 512 to save VRAM (compensates for larger 128x128 images)
 
         tau = 0.004
 
@@ -879,7 +951,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=50000,  # Reduced from 30000 to save ~600MB RAM
+            buffer_size=35000,  # Reduced from 50k to 35k (compensates for larger 128x128 images)
 
             # Note: optimize_memory_usage not supported with Dict observation spaces
 
@@ -908,10 +980,12 @@ if __name__ == "__main__":
     
     # Create replay buffer checkpoint callback (full checkpoint every 10k steps)
     # This saves both model weights AND replay buffer for seamless resume
+    # Keeps only last 3 checkpoints to save disk space (~1.5GB each)
     replay_buffer_checkpoint_callback = ReplayBufferCheckpointCallback(
         save_freq=10000,  # Save every 10k steps (vs 2k for lightweight model-only saves)
         save_path='./checkpoints/',
         name_prefix='sac_carla_full',
+        keep_last_n=3,  # Keep last 3 checkpoints (~4.5GB max), auto-delete older ones
         verbose=1
     )
 

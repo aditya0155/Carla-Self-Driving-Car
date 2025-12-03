@@ -223,36 +223,65 @@ class CombinedExtractor(BaseFeaturesExtractor):
         
         # ========== STATE MLP ==========
         state_dim = observation_space.spaces["state"].shape[0]  # dynamically determined (currently 5)
-        # MLP for state with LayerNorm for stability
-
+        # State features: 102 (5% of total 2048)
+        state_features_dim = 102
+        
+        # MLP for state: maps 5D state to 102 features
         self.mlp = nn.Sequential(
-
-            nn.Linear(state_dim, 128),
-
+            nn.Linear(state_dim, 64),
             nn.ReLU(),
-
-            nn.Linear(128, 128),
-
+            nn.Linear(64, state_features_dim),
             nn.ReLU()
-
         )
 
         
-        # ========== FUSION LAYERS ==========
-        self.attention_layer = nn.Linear(cnn_out_dim, 128)
+        # ========== FUSION LAYERS (LIDAR-BIASED: 50% Camera, 45% LIDAR, 5% State) ==========
+        # 
+        # Feature distribution optimized for obstacle avoidance with LIDAR!
+        # 
+        # Total: 2048 features
+        # - Camera:  1024 features (50%) - lane following, road texture
+        # - LIDAR:    922 features (45%) - obstacle detection, spatial awareness
+        # - State:    102 features (5%)  - speed, position, heading
+        # 
+        # LIDAR is nearly equal to camera for better obstacle avoidance!
         
-        # LIDAR feature projection to match state features
+        # Camera bottleneck: compress 4096 → 1024 features (50%)
+        camera_features_dim = 1024
+        self.camera_bottleneck = nn.Sequential(
+            nn.Linear(cnn_out_dim, camera_features_dim),
+            nn.ReLU()
+        )
+        
+        # Attention layer: camera (1024) guides state importance
+        self.attention_layer = nn.Linear(camera_features_dim, state_features_dim)
+        
+        # LIDAR feature expansion: expand to 922 features (45%)
+        # This gives LIDAR almost as much influence as camera!
+        lidar_features_dim = 922
         self.lidar_projection = nn.Sequential(
-            nn.Linear(lidar_cnn_out_dim, 128),
+            nn.Linear(lidar_cnn_out_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, lidar_features_dim),
             nn.ReLU()
         )
-
         
-        # Combined: image_features + state_features + lidar_features
-        combined_dim = cnn_out_dim + 128 + 128  # image + state + lidar = 4096 + 128 + 128 = 4352
+        # Combined: camera + state + lidar = 1024 + 102 + 922 = 2048
+        combined_dim = camera_features_dim + state_features_dim + lidar_features_dim
 
-        # Two-stage FC to reduce parameters: 4352 -> 512 -> features_dim
-        # This reduces FC params from 4.4M to ~800K (5.5x reduction!)
+        # Log the LIDAR-biased feature distribution
+        console.log(f"[bold green]╔═══════════════════════════════════════════════════════╗[/bold green]")
+        console.log(f"[bold green]║   FEATURE DISTRIBUTION (LIDAR-BIASED FOR SAFETY)      ║[/bold green]")
+        console.log(f"[bold green]╠═══════════════════════════════════════════════════════╣[/bold green]")
+        console.log(f"[green]║ Camera:  {camera_features_dim:>5} features ({100*camera_features_dim/combined_dim:.1f}%) - bottleneck[/green]")
+        console.log(f"[green]║ LIDAR:   {lidar_features_dim:>5} features ({100*lidar_features_dim/combined_dim:.1f}%) - EXPANDED![/green]")
+        console.log(f"[green]║ State:   {state_features_dim:>5} features ({100*state_features_dim/combined_dim:.1f}%) - MLP[/green]")
+        console.log(f"[bold green]╠═══════════════════════════════════════════════════════╣[/bold green]")
+        console.log(f"[bold cyan]║ TOTAL:   {combined_dim:>5} features (100.0%)[/bold cyan]")
+        console.log(f"[bold green]║ LIDAR boosted for better obstacle avoidance!          ║[/bold green]")
+        console.log(f"[bold green]╚═══════════════════════════════════════════════════════╝[/bold green]")
+
+        # Two-stage FC to reduce parameters: 2048 -> 512 -> features_dim
         self.fc = nn.Sequential(
             nn.Linear(combined_dim, 512),
             nn.ReLU(),
@@ -324,7 +353,10 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
 
     def forward(self, observations):
-
+        # ========== LIDAR-BIASED FEATURE EXTRACTION ==========
+        # Feature distribution: Camera 50% (1024), LIDAR 45% (922), State 5% (102)
+        # Total: 2048 features optimized for obstacle avoidance!
+        
         # Process image (no autocast here - causes dtype issues with fc layer)
         # Handle both channel-first (batch, C, H, W) and channel-last (batch, H, W, C) formats
         # For grayscale: C=1, for RGB: C=3
@@ -344,7 +376,9 @@ class CombinedExtractor(BaseFeaturesExtractor):
             # Fallback: assume channel-last and permute
             image = img.permute(0, 3, 1, 2).float() / 255.0
         
-        image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
+        # Camera CNN → bottleneck (4096 → 1024 features, 50%)
+        raw_image_features = self.cnn(image)  # shape: [batch, 4096]
+        image_features = self.camera_bottleneck(raw_image_features)  # shape: [batch, 1024]
         
         # Process LIDAR BEV grid (uint8 [0, 255] -> float [0, 1])
         # LIDAR BEV is 64x64x1, same handling as image
@@ -362,17 +396,19 @@ class CombinedExtractor(BaseFeaturesExtractor):
             # Fallback: assume channel-last and permute
             lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0
         
-        lidar_features = self.lidar_cnn(lidar)  # shape: [batch, lidar_cnn_out_dim]
-        lidar_features = self.lidar_projection(lidar_features)  # shape: [batch, 128]
+        # LIDAR CNN → projection (raw → 922 features, 45%)
+        raw_lidar_features = self.lidar_cnn(lidar)  # shape: [batch, lidar_cnn_out_dim]
+        lidar_features = self.lidar_projection(raw_lidar_features)  # shape: [batch, 922]
         
-        # Process state
-        state_features = self.mlp(observations["state"].float())  # shape: [batch, 128]
+        # Process state (102 features, 5%)
+        state_features = self.mlp(observations["state"].float())  # shape: [batch, 102]
         
-        # Attention-weighted fusion (image guides state importance)
-        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 128]
+        # Attention-weighted fusion (bottlenecked camera 1024 → guides state 102)
+        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 102]
         fused_state = state_features * attn_weights
         
-        # Concatenate all features: image + state (attention-weighted) + lidar
+        # Concatenate all features: camera + state (attention-weighted) + lidar
+        # Total: 1024 + 102 + 922 = 2048 features (LIDAR-biased for safety!)
         concatenated = torch.cat([image_features, fused_state, lidar_features], dim=1)
 
         concatenated = torch.nan_to_num(concatenated, nan=0.0, posinf=1e3, neginf=-1e3)

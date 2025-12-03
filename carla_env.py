@@ -274,6 +274,30 @@ class CustomSAC(SAC):
             print(f"[SAC] step: {self.num_timesteps}, α: {current_alpha:.4f}, "
                   f"target_H: {self.fixed_target_entropy:.3f} (fixed, no clamp)")
 
+    def _excluded_save_params(self):
+        """
+        Return parameters that should be excluded from being saved.
+        
+        GradScaler contains _thread.RLock which cannot be pickled.
+        We exclude it and recreate it on load.
+        """
+        excluded = super()._excluded_save_params()
+        # Add our custom non-picklable attributes
+        # GradScaler has thread locks that can't be pickled
+        excluded.add("scaler")
+        excluded.add("use_mixed_precision")  # Simple bool, recreated on load
+        return excluded
+
+    def _get_torch_save_params(self):
+        """
+        Get the name of torch variables that will be saved with PyTorch's ``th.save``.
+        
+        Override to ensure scaler is not included in saved state.
+        """
+        state_dicts, saved_pytorch_variables = super()._get_torch_save_params()
+        # scaler is handled separately (recreated on load)
+        return state_dicts, saved_pytorch_variables
+
     
 
     @classmethod
@@ -455,12 +479,20 @@ class CarlaEnv(gym.Env):
         # GRAYSCALE IMAGE: 84x84x1 - standard RL vision size for efficiency
         # Memory: 84*84*1 = 7,056 bytes (very efficient!)
         # Grayscale preserves edge information for lane detection
+        # 
+        # STATE VECTOR (4D): Only non-visual info that CNN can't see!
+        # - x, y: Position (for path planning context)
+        # - speed: Current velocity (crucial for control)
+        # - yaw: Heading direction (for steering decisions)
+        # 
+        # NOTE: lidar_min_distance REMOVED - redundant with LIDAR BEV CNN!
+        # The CNN extracts spatial obstacle info from the 64x64 BEV grid.
 
         self.observation_space = spaces.Dict({
 
             "image": spaces.Box(low=0, high=255, shape=(camera_height, camera_width, 1), dtype=np.uint8),
 
-            "state": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
+            "state": spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32),
             
             # BEV LIDAR occupancy grid: 64x64 single-channel image
             # Values: 0 = free space, 255 = occupied (uint8 for memory efficiency)
@@ -533,6 +565,9 @@ class CarlaEnv(gym.Env):
 
         self.lidar_min_distance = float('inf')
         
+        # Forward-facing camera for CNN observations (separate from visualization camera)
+        self.forward_camera = None
+        
         # BEV occupancy grid (bev_grid_size already defined above before observation_space)
         self.lidar_bev = np.zeros((self.bev_grid_size, self.bev_grid_size), dtype=np.uint8)
 
@@ -565,8 +600,9 @@ class CarlaEnv(gym.Env):
 
         # State normalization parameters (for normalizing state to ~[-1, 1] range)
         # These are approximate ranges based on typical CARLA values
-        self.state_mean = np.array([0.0, 0.0, 10.0, 0.0, 12.5], dtype=np.float32)  # [x, y, speed, yaw, lidar]
-        self.state_std = np.array([200.0, 200.0, 15.0, 180.0, 12.5], dtype=np.float32)  # Std dev for normalization (lidar: 25m/2)
+        # NOTE: lidar_min_distance REMOVED - now handled by LIDAR BEV CNN
+        self.state_mean = np.array([0.0, 0.0, 10.0, 0.0], dtype=np.float32)  # [x, y, speed, yaw]
+        self.state_std = np.array([200.0, 200.0, 15.0, 180.0], dtype=np.float32)  # Std dev for normalization
         
         # Image augmentation flag (enabled during training for robustness)
         self.use_augmentation = True
@@ -664,7 +700,7 @@ class CarlaEnv(gym.Env):
         """Clean up all spawned actors before map change."""
         try:
             # Destroy sensors
-            for sensor in [self.camera, self.collision_sensor, self.lane_invasion_sensor,
+            for sensor in [self.camera, self.forward_camera, self.collision_sensor, self.lane_invasion_sensor,
                           self.imu_sensor, self.lidar_sensor]:
                 if sensor is not None:
                     try:
@@ -689,6 +725,7 @@ class CarlaEnv(gym.Env):
             # Reset references
             self.vehicle = None
             self.camera = None
+            self.forward_camera = None
             self.collision_sensor = None
             self.lane_invasion_sensor = None
             self.imu_sensor = None
@@ -842,7 +879,7 @@ class CarlaEnv(gym.Env):
 
         try:
 
-            for sensor in [self.camera, self.collision_sensor, self.lane_invasion_sensor,
+            for sensor in [self.camera, self.forward_camera, self.collision_sensor, self.lane_invasion_sensor,
 
                         self.imu_sensor, self.lidar_sensor]:
 
@@ -993,6 +1030,33 @@ class CarlaEnv(gym.Env):
                 console.log(f"[red]Failed to create camera: {e}[/red]")
 
                 self.camera = None
+
+
+
+            # --- Attach FORWARD-FACING camera for CNN observations ---
+            # This camera is positioned on the hood looking forward (driver's POV)
+            # Used for the 84x84 grayscale CNN input - separate from visualization camera
+            try:
+                forward_camera_bp = blueprint_library.find('sensor.camera.rgb')
+                forward_camera_bp.set_attribute('enable_postprocess_effects', 'True')
+                forward_camera_bp.set_attribute('exposure_mode', 'auto')
+                # Use observation dimensions directly (84x84) for efficiency
+                forward_camera_bp.set_attribute('image_size_x', str(self.camera_width))
+                forward_camera_bp.set_attribute('image_size_y', str(self.camera_height))
+                forward_camera_bp.set_attribute('fov', '90')  # Narrower FOV for better forward detail
+                forward_camera_bp.set_attribute('sensor_tick', '0.1')
+                # Hood-level forward-facing position (like a dashcam)
+                forward_camera_transform = carla.Transform(
+                    carla.Location(x=2.0, y=0.0, z=1.4),  # Front of hood, ~1.4m height
+                    carla.Rotation(pitch=-8, yaw=0, roll=0)  # Slight downward angle to see road
+                )
+                self.forward_camera = self.world.spawn_actor(forward_camera_bp, forward_camera_transform, attach_to=self.vehicle)
+                resources_to_cleanup.append(self.forward_camera)
+                self.forward_camera.listen(lambda image: self._process_forward_image(image))
+                console.log(f"[green]Forward CNN camera attached (84x84, hood-level, FOV=90°)[/green]")
+            except Exception as e:
+                console.log(f"[red]Failed to create forward camera: {e}[/red]")
+                self.forward_camera = None
 
 
 
@@ -1158,21 +1222,9 @@ class CarlaEnv(gym.Env):
 
 
 
-            # Default values in case of failure
-
-            lidar_min = float('inf')
-
-            
-
-            # Safely retrieve sensor data
-
-            if hasattr(self, 'lidar_min_distance'):
-
-                lidar_min = self.lidar_min_distance
-
-
-
-            # Build state vector (5-dim, reduced from 8-dim)
+            # Build state vector (4D): position, speed, heading
+            # NOTE: lidar_min_distance REMOVED - redundant with LIDAR BEV CNN!
+            # The CNN extracts spatial obstacle info from the 64x64 BEV grid.
 
             state = np.array([
 
@@ -1182,9 +1234,7 @@ class CarlaEnv(gym.Env):
 
                 speed,
 
-                transform.rotation.yaw,
-
-                lidar_min
+                transform.rotation.yaw
 
             ], dtype=np.float32)
 
@@ -1246,6 +1296,8 @@ class CarlaEnv(gym.Env):
 
             self.camera = None
 
+            self.forward_camera = None
+
             self.collision_sensor = None
 
             self.lane_invasion_sensor = None
@@ -1256,9 +1308,9 @@ class CarlaEnv(gym.Env):
 
             
 
-            # Return a blank observation (normalized zero state)
+            # Return a blank observation (normalized zero state - 4D: x, y, speed, yaw)
 
-            default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
+            default_state = self._normalize_state(np.zeros(4, dtype=np.float32))
 
             return {"image": np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
 
@@ -1268,20 +1320,44 @@ class CarlaEnv(gym.Env):
 
 
     def _process_image(self, image):
-
+        """
+        Process VISUALIZATION camera image (third-person chase camera).
+        This is only used for the pygame display window, NOT for CNN observations.
+        """
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
-
         array = array.reshape((image.height, image.width, 4))  # BGRA format
 
         # Use cv2.cvtColor to convert from BGRA to RGB for display
         rgb_image = cv2.cvtColor(array, cv2.COLOR_BGRA2RGB)
+
+        # Use the full-resolution RGB image for rendering to maintain visual quality
+        if self.visualize:
+            self.camera_image = rgb_image
+        else:
+            # For non-visual mode, store grayscale (but render() won't use it)
+            gray_image = cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
+            self.camera_image = gray_image
+
+    def _process_forward_image(self, image):
+        """
+        Process FORWARD-FACING camera image for CNN observations.
+        This camera is hood-level, looking forward (dashcam style).
+        Used for the 84x84 grayscale observation sent to the policy network.
+        
+        Every image is saved to image_log_dir for analysis/debugging.
+        """
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))  # BGRA format
         
         # Convert to GRAYSCALE for observation (better lane detection, less memory)
         # Grayscale preserves edge information while reducing 3 channels to 1
         gray_image = cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
 
-        # Resize to observation dimensions (160x120)
-        resized_gray = cv2.resize(gray_image, (self.camera_width, self.camera_height))
+        # Camera is already 84x84 (set in blueprint attributes), but resize just in case
+        if gray_image.shape[0] != self.camera_height or gray_image.shape[1] != self.camera_width:
+            resized_gray = cv2.resize(gray_image, (self.camera_width, self.camera_height))
+        else:
+            resized_gray = gray_image
         
         # Apply augmentation during training for robustness (grayscale-compatible)
         if self.use_augmentation and random.random() < 0.3:  # 30% chance of augmentation
@@ -1289,13 +1365,6 @@ class CarlaEnv(gym.Env):
         
         # Add channel dimension: (H, W) -> (H, W, 1) for observation space compatibility
         self.camera_image_obs = resized_gray[:, :, np.newaxis].astype(np.uint8)
-
-        # Use the full-resolution RGB image for rendering to maintain visual quality
-        if self.visualize:
-            self.camera_image = rgb_image
-        else:
-            # For non-visual mode, store grayscale (but render() won't use it)
-            self.camera_image = resized_gray
 
     def _augment_image(self, image):
         """
@@ -1366,11 +1435,9 @@ class CarlaEnv(gym.Env):
         Normalize state values to approximately [-1, 1] range for better neural network training.
         Uses z-score normalization: (x - mean) / std
         
-        IMPORTANT: Clamps infinite LIDAR values to max range (25m) to prevent NaN in neural network.
+        State vector (4D): [x, y, speed, yaw]
+        NOTE: lidar_min_distance removed - now handled by LIDAR BEV CNN.
         """
-        # Clamp LIDAR distance (index 4) to max range of 25m to prevent inf
-        state = state.copy()
-        state[4] = min(state[4], 25.0)  # LIDAR max range is 25m (reduced for denser BEV)
         return (state - self.state_mean) / (self.state_std + 1e-8)
 
 
@@ -1561,7 +1628,7 @@ class CarlaEnv(gym.Env):
         # Safety check: if vehicle is None (e.g., after a failed reset), return early
         if self.vehicle is None:
             console.log("[red][STEP] Vehicle is None! Returning dummy observation.[/red]")
-            default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
+            default_state = self._normalize_state(np.zeros(4, dtype=np.float32))
             return {"image": np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
                     "state": default_state,
                     "lidar_bev": np.zeros((self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)}, -100.0, True, {"error": "vehicle_none"}
@@ -1659,6 +1726,8 @@ class CarlaEnv(gym.Env):
 
 
 
+        # Build state vector (4D): position, speed, heading
+        # NOTE: lidar_min_distance REMOVED - redundant with LIDAR BEV CNN!
         state = np.array([
 
             current_location.x,
@@ -1667,9 +1736,7 @@ class CarlaEnv(gym.Env):
 
             speed,
 
-            transform.rotation.yaw,
-
-            self.lidar_min_distance
+            transform.rotation.yaw
 
         ], dtype=np.float32)
 
@@ -2043,7 +2110,7 @@ class CarlaEnv(gym.Env):
 
         try:
 
-            for sensor in [self.collision_sensor, self.camera, self.imu_sensor,
+            for sensor in [self.collision_sensor, self.camera, self.forward_camera, self.imu_sensor,
 
                         self.lane_invasion_sensor, self.lidar_sensor]:
 
@@ -2088,6 +2155,8 @@ class CarlaEnv(gym.Env):
             self.vehicle = None
 
             self.camera = None
+
+            self.forward_camera = None
 
             self.collision_sensor = None
 

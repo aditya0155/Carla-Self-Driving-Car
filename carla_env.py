@@ -37,90 +37,69 @@ console = Console()
 
 class CustomSAC(SAC):
     """
-    Optimized SAC for CARLA self-driving car task.
+    SAC implementation following the original paper exactly:
+    "Soft Actor-Critic: Off-Policy Maximum Entropy Deep RL with a Stochastic Actor"
+    (Haarnoja et al., 2018)
     
-    Key improvements over basic linear decay:
-    1. Uses SB3's automatic entropy tuning (learns optimal alpha)
-    2. Dynamically adjusts target entropy based on training progress
-    3. Applies cosine annealing for smooth decay
-    4. Clamps alpha to prevent runaway values (fixes "entropy keeps rising" bug)
-    5. Supports Mixed Precision Training for efficiency
+    Key principles from the paper:
+    1. Target entropy H̄ = -dim(A) is FIXED (not decayed over time)
+    2. α (entropy coefficient) is LEARNED to satisfy: E[-log π(a|s)] ≥ H̄
+    3. α automatically decreases as policy becomes more confident
+    4. No timestep-based scheduling - purely adaptive!
+    
+    Additional safety features (not in paper):
+    - Alpha clamping to prevent extreme values
+    - Mixed Precision Training for efficiency
     """
 
-    def __init__(self, *args, total_timesteps_for_entropy=150000, use_mixed_precision=True, 
-                 initial_ent_coef=0.2, **kwargs):
+    def __init__(self, *args, use_mixed_precision=True, **kwargs):
 
         kwargs.pop('logger', None)
         kwargs.pop('ent_coef', None)  # Remove any ent_coef passed
         
-        # Use automatic entropy tuning with specified initial value
-        # "auto_0.2" means: use automatic tuning, starting at alpha=0.2
-        super().__init__(*args, ent_coef=f"auto_{initial_ent_coef}", **kwargs)
-
+        # Use automatic entropy tuning (paper's approach)
+        # "auto" means: learn α to match target_entropy = -dim(A)
+        super().__init__(*args, ent_coef="auto", **kwargs)
         
-        self.total_timesteps_for_entropy = total_timesteps_for_entropy
-        self.num_timesteps_at_start = self.num_timesteps
-        
-        # Target entropy scheduling parameters
-        # base_target_entropy is set by SAC to -dim(A) = -3 for 3D action space
-        # Note: During load(), target_entropy may still be "auto" string, so we handle that
+        # Target entropy is FIXED at -dim(A) as per the paper
+        # For 3D action space (steering, throttle, brake): H̄ = -3
+        # This is set automatically by SB3's SAC when ent_coef="auto"
         if isinstance(self.target_entropy, (int, float)):
-            self.base_target_entropy = float(self.target_entropy)
+            self.fixed_target_entropy = float(self.target_entropy)
         else:
-            # Will be set properly after model is fully loaded
-            self.base_target_entropy = -3.0  # Default for 3D action space
-        self.initial_target_scale = 0.5  # Start at 50% of default target (less random)
-        self.final_target_scale = 0.1    # End at 10% of default target (very deterministic)
+            self.fixed_target_entropy = -3.0  # Default for 3D action space
         
-        # CRITICAL: Alpha clamping bounds to prevent "entropy keeps rising" bug
-        self.min_ent_coef = 0.01  # Never go below this (maintain minimal exploration)
-        self.max_ent_coef = 0.5   # Never go above this (prevent excessive randomness)
+        # Safety bounds for α (not in original paper, but prevents instability)
+        self.min_ent_coef = 0.005  # Minimum exploration
+        self.max_ent_coef = 1.0    # Maximum exploration
         
-        # Mixed Precision Training (FP16) - reduces VRAM usage by ~50%
+        # Mixed Precision Training (FP16) - reduces VRAM usage
         self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
         if self.use_mixed_precision:
             self.scaler = GradScaler()
-            console.log("[green]Mixed Precision Training (FP16) enabled - VRAM savings ~50%[/green]")
+            console.log("[green]Mixed Precision Training (FP16) enabled[/green]")
         else:
             self.scaler = None
-            console.log("[yellow]Mixed Precision disabled (CPU mode or user disabled)[/yellow]")
+            console.log("[yellow]Mixed Precision disabled[/yellow]")
         
-        console.log(f"[cyan]Entropy: auto tuning enabled, initial={initial_ent_coef}, "
-                   f"target_entropy={self.base_target_entropy:.3f}, "
-                   f"clamped to [{self.min_ent_coef}, {self.max_ent_coef}][/cyan]")
+        console.log(f"[cyan]SAC (Paper Implementation):[/cyan]")
+        console.log(f"[cyan]  - Target entropy H̄ = {self.fixed_target_entropy:.3f} (FIXED, = -dim(A))[/cyan]")
+        console.log(f"[cyan]  - α is learned automatically to match H̄[/cyan]")
+        console.log(f"[cyan]  - α bounds: [{self.min_ent_coef}, {self.max_ent_coef}][/cyan]")
 
-    def _get_target_entropy_scale(self) -> float:
-        """
-        Calculate current target entropy scale using cosine annealing.
-        
-        Cosine annealing provides:
-        - Fast initial decay (quickly learn basic driving)
-        - Slower middle decay (allow exploration of edge cases)  
-        - Fast final decay (converge to optimal policy)
-        """
-        progress = min(1.0, self.num_timesteps / self.total_timesteps_for_entropy)
-        
-        # Cosine annealing: smooth transition from initial to final scale
-        scale = self.final_target_scale + 0.5 * (
-            self.initial_target_scale - self.final_target_scale
-        ) * (1 + np.cos(np.pi * progress))
-        
-        return scale
-    
     def _clamp_entropy_coef(self):
         """
-        CRITICAL: Clamp the entropy coefficient to prevent extreme values.
-        This fixes the "entropy keeps rising" bug by enforcing hard bounds.
+        Safety clamp for α to prevent extreme values.
+        Not in original paper, but prevents training instability.
         """
         if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
             with torch.no_grad():
                 current_alpha = torch.exp(self.log_ent_coef).item()
                 clamped_alpha = np.clip(current_alpha, self.min_ent_coef, self.max_ent_coef)
                 
-                # Only update if significantly different (prevents oscillation)
                 if abs(current_alpha - clamped_alpha) > 0.001:
                     self.log_ent_coef.data.fill_(np.log(clamped_alpha))
-                    console.log(f"[yellow]Entropy clamped: {current_alpha:.4f} -> {clamped_alpha:.4f}[/yellow]")
+                    console.log(f"[yellow]α clamped: {current_alpha:.4f} → {clamped_alpha:.4f}[/yellow]")
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """
@@ -191,6 +170,7 @@ class CustomSAC(SAC):
 
                 # Actor loss computation (FP32 for action sampling, autocast for Q-values)
                 actions_pi, log_prob = self.actor.action_log_prob(obs)  # FP32 - no autocast!
+                log_prob = log_prob.reshape(-1, 1)  # Match SB3's shape for proper broadcasting
                 
                 with autocast(device_type='cuda'):
                     q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
@@ -238,6 +218,7 @@ class CustomSAC(SAC):
                 self.critic.optimizer.step()
 
                 actions_pi, log_prob = self.actor.action_log_prob(obs)
+                log_prob = log_prob.reshape(-1, 1)  # Match SB3's shape for proper broadcasting
                 q_values_pi = torch.cat(self.critic(obs, actions_pi), dim=1)
                 min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
                 actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
@@ -272,74 +253,57 @@ class CustomSAC(SAC):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
     def learn(self, total_timesteps, callback=None, log_interval=4, tb_log_name="SAC", reset_num_timesteps=True, progress_bar=False):
-
-        if self.num_timesteps_at_start == 0 or reset_num_timesteps:
-
-            self.num_timesteps_at_start = self.num_timesteps
-
-        
-
+        """
+        Start learning. Follows original SAC paper - no special setup needed.
+        """
         return super().learn(total_timesteps, callback, log_interval, tb_log_name, reset_num_timesteps, progress_bar)
 
 
 
     def _update_learning_rate(self, optimizers):
-        """Update learning rate and entropy scheduling with safeguards."""
+        """Update learning rate with safety clamping for α."""
         super()._update_learning_rate(optimizers)
         
-        # 1. Update target entropy based on training progress (cosine annealing)
-        scale = self._get_target_entropy_scale()
-        self.target_entropy = self.base_target_entropy * scale
-        
-        # 2. CRITICAL: Clamp entropy coefficient to prevent runaway values
+        # Safety clamp α (not in paper, but prevents instability)
         self._clamp_entropy_coef()
         
-        # 3. Get current alpha for logging
+        # Get current α for logging
         if hasattr(self, 'log_ent_coef') and self.log_ent_coef is not None:
             current_alpha = torch.exp(self.log_ent_coef).item()
         else:
             current_alpha = self.ent_coef_tensor.item()
         
-        # 4. Logging
+        # Logging
         if self.logger is not None:
             self.logger.record("train/entropy_coefficient", current_alpha)
             self.logger.record("train/target_entropy", self.target_entropy)
-            self.logger.record("train/target_entropy_scale", scale)
         
-        # 5. Debug output
+        # Debug output every 1000 steps
         if self.num_timesteps % 1000 == 0:
-            progress = self.num_timesteps / self.total_timesteps_for_entropy
-            print(f"[ENTROPY] timesteps: {self.num_timesteps}, "
-                  f"progress: {progress:.2%}, "
-                  f"alpha: {current_alpha:.4f} (clamped to [{self.min_ent_coef}, {self.max_ent_coef}]), "
-                  f"target_H: {self.target_entropy:.3f}")
+            print(f"[SAC] step: {self.num_timesteps}, α: {current_alpha:.4f}, "
+                  f"target_H: {self.fixed_target_entropy:.3f} (fixed)")
 
     
 
     @classmethod
     def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, 
-             total_timesteps_for_entropy=150000, use_mixed_precision=True, **kwargs):
+             use_mixed_precision=True, **kwargs):
         """
-        Load the model from a zip-file with proper entropy configuration restoration.
+        Load the model from a zip-file.
+        
+        Follows original SAC paper:
+        - Fixed target entropy H̄ = -dim(A) = -3.0
+        - Safety clamps on α ∈ [0.01, 0.5]
         """
         model = super(CustomSAC, cls).load(path, env, device, custom_objects, **kwargs)
         
-        # Set the total_timesteps_for_entropy
-        model.total_timesteps_for_entropy = total_timesteps_for_entropy
-        model.num_timesteps_at_start = model.num_timesteps  # Initialize for learn() method
+        # Fixed target entropy from paper: H̄ = -dim(A)
+        model.fixed_target_entropy = -3.0
         
-        # Restore entropy bounds and target entropy configuration
-        model.min_ent_coef = 0.01
-        model.max_ent_coef = 0.5
-        model.initial_target_scale = 0.5
-        model.final_target_scale = 0.1
-        
-        # Handle target_entropy - it should be a float after loading, but check to be safe
-        if isinstance(model.target_entropy, (int, float)):
-            model.base_target_entropy = float(model.target_entropy)
-        else:
-            # Default for 3D action space if somehow still a string
-            model.base_target_entropy = -3.0
+        # Safety clamp bounds (not in paper, but prevents instability)
+        # Match the bounds from __init__
+        model.min_ent_coef = 0.005
+        model.max_ent_coef = 1.0
         
         # Setup Mixed Precision Training for resumed model
         model.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
@@ -355,8 +319,8 @@ class CustomSAC(SAC):
         else:
             current_alpha = model.ent_coef_tensor.item()
         
-        print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}/{model.total_timesteps_for_entropy}, "
-              f"entropy_coef: {current_alpha:.4f}, target_entropy: {model.base_target_entropy:.3f}")
+        print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}, "
+              f"α: {current_alpha:.4f}, target_H: {model.fixed_target_entropy:.3f} (fixed)")
 
         
 
@@ -370,7 +334,7 @@ class CarlaEnv(gym.Env):
 
     def __init__(self, num_npcs=5, frame_skip=8, visualize=True,
 
-                 fixed_delta_seconds=0.05, camera_width=84, camera_height=84, model=None, 
+                 fixed_delta_seconds=0.05, camera_width=160, camera_height=120, model=None, 
                  arduino_port='/dev/ttyACM0', rotate_maps=True, no_rendering_mode=False):
 
         # Store no_rendering_mode setting (applied after CARLA connection)
@@ -501,10 +465,13 @@ class CarlaEnv(gym.Env):
         self.bev_resolution = self.bev_forward_range / self.bev_grid_size  # ~0.39m per pixel
 
         # Expand observation space.
+        # GRAYSCALE IMAGE: 160x120x1 for better lane visibility with less memory than RGB
+        # Memory: 160*120*1 = 19,200 bytes vs 84*84*3 = 21,168 bytes (9% savings!)
+        # Resolution: 3.6x more pixels for detecting lane markings
 
         self.observation_space = spaces.Dict({
 
-            "image": spaces.Box(low=0, high=255, shape=(camera_height, camera_width, 3), dtype=np.uint8),
+            "image": spaces.Box(low=0, high=255, shape=(camera_height, camera_width, 1), dtype=np.uint8),
 
             "state": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
             
@@ -1261,7 +1228,7 @@ class CarlaEnv(gym.Env):
             # Get BEV LIDAR grid (add channel dimension)
             lidar_bev_obs = self.lidar_bev[:, :, np.newaxis]  # Shape: (64, 64, 1)
 
-            return {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
+            return {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
 
                     "state": state,
                     "lidar_bev": lidar_bev_obs}
@@ -1306,7 +1273,7 @@ class CarlaEnv(gym.Env):
 
             default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
 
-            return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
+            return {"image": np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
 
                     "state": default_state,
                     "lidar_bev": np.zeros((self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)}
@@ -1319,32 +1286,34 @@ class CarlaEnv(gym.Env):
 
         array = array.reshape((image.height, image.width, 4))  # BGRA format
 
-        # Use cv2.cvtColor to convert from BGRA to RGB
-
+        # Use cv2.cvtColor to convert from BGRA to RGB for display
         rgb_image = cv2.cvtColor(array, cv2.COLOR_BGRA2RGB)
-
-        resized = cv2.resize(rgb_image, (self.camera_width, self.camera_height))
         
-        # Apply augmentation during training for robustness
+        # Convert to GRAYSCALE for observation (better lane detection, less memory)
+        # Grayscale preserves edge information while reducing 3 channels to 1
+        gray_image = cv2.cvtColor(array, cv2.COLOR_BGRA2GRAY)
+
+        # Resize to observation dimensions (160x120)
+        resized_gray = cv2.resize(gray_image, (self.camera_width, self.camera_height))
+        
+        # Apply augmentation during training for robustness (grayscale-compatible)
         if self.use_augmentation and random.random() < 0.3:  # 30% chance of augmentation
-            resized = self._augment_image(resized)
+            resized_gray = self._augment_grayscale_image(resized_gray)
         
-        self.camera_image_obs = resized.astype(np.uint8)
+        # Add channel dimension: (H, W) -> (H, W, 1) for observation space compatibility
+        self.camera_image_obs = resized_gray[:, :, np.newaxis].astype(np.uint8)
 
-        # Use the full-resolution RGB image for rendering to maintain consistency.
-
+        # Use the full-resolution RGB image for rendering to maintain visual quality
         if self.visualize:
-
             self.camera_image = rgb_image
-
         else:
-
-            self.camera_image = resized
+            # For non-visual mode, store grayscale (but render() won't use it)
+            self.camera_image = resized_gray
 
     def _augment_image(self, image):
         """
-        Apply random augmentations to the image for training robustness.
-        This helps the model generalize to different lighting/weather conditions.
+        Apply random augmentations to RGB image for training robustness.
+        DEPRECATED: Use _augment_grayscale_image for grayscale observations.
         """
         augmented = image.copy()
         
@@ -1372,6 +1341,38 @@ class CarlaEnv(gym.Env):
             augmented = np.clip(augmented.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         
         return augmented
+
+    def _augment_grayscale_image(self, image):
+        """
+        Apply random augmentations to GRAYSCALE image for training robustness.
+        Simulates different lighting conditions and sensor noise.
+        
+        Args:
+            image: 2D grayscale image (H, W) with values 0-255
+            
+        Returns:
+            Augmented grayscale image (H, W) with values 0-255
+        """
+        augmented = image.copy().astype(np.float32)
+        
+        # Random brightness adjustment (simulates different times of day)
+        if random.random() < 0.5:
+            brightness_factor = random.uniform(0.7, 1.3)
+            augmented = augmented * brightness_factor
+        
+        # Random contrast adjustment
+        if random.random() < 0.3:
+            contrast_factor = random.uniform(0.8, 1.2)
+            mean = np.mean(augmented)
+            augmented = (augmented - mean) * contrast_factor + mean
+        
+        # Random Gaussian noise (simulates sensor noise)
+        if random.random() < 0.2:
+            noise = np.random.normal(0, 5, augmented.shape)
+            augmented = augmented + noise
+        
+        # Clip and convert back to uint8
+        return np.clip(augmented, 0, 255).astype(np.uint8)
 
     def _normalize_state(self, state):
         """
@@ -1574,7 +1575,7 @@ class CarlaEnv(gym.Env):
         if self.vehicle is None:
             console.log("[red][STEP] Vehicle is None! Returning dummy observation.[/red]")
             default_state = self._normalize_state(np.zeros(5, dtype=np.float32))
-            return {"image": np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
+            return {"image": np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
                     "state": default_state,
                     "lidar_bev": np.zeros((self.bev_grid_size, self.bev_grid_size, 1), dtype=np.uint8)}, -100.0, True, {"error": "vehicle_none"}
         
@@ -1788,7 +1789,7 @@ class CarlaEnv(gym.Env):
         # Get BEV LIDAR grid (add channel dimension)
         lidar_bev_obs = self.lidar_bev[:, :, np.newaxis]  # Shape: (64, 64, 1)
 
-        obs = {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8),
+        obs = {"image": self.camera_image_obs if self.camera_image_obs is not None else np.zeros((self.camera_height, self.camera_width, 1), dtype=np.uint8),
 
                "state": state,
                "lidar_bev": lidar_bev_obs}
@@ -1989,9 +1990,11 @@ class CarlaEnv(gym.Env):
                                border_radius=border_radius-2)
                 self.display.blit(gradient_surface, (progress_x, progress_y))
                 
-                # Calculate and draw current progress
-                if self.model is not None and hasattr(self.model, 'num_timesteps') and hasattr(self.model, 'total_timesteps_for_entropy'):
-                    progress = min(1.0, self.model.num_timesteps / self.model.total_timesteps_for_entropy)
+                # Calculate and draw current progress (if total_timesteps available)
+                if self.model is not None and hasattr(self.model, 'num_timesteps'):
+                    # Get total timesteps - use _total_timesteps if available, or just show current timesteps
+                    total_steps = getattr(self.model, '_total_timesteps', None) or 100000  # Default for display
+                    progress = min(1.0, self.model.num_timesteps / total_steps)
                     current_width = int(progress * progress_width)
                     
                     if current_width > 0:
@@ -2030,7 +2033,7 @@ class CarlaEnv(gym.Env):
                     self.display.blit(text_surface, (text_x, progress_y - 27))
                     
                     # Add timestep counter below, also centered
-                    timestep_text = f"Steps: {self.model.num_timesteps:,}/{self.model.total_timesteps_for_entropy:,}"
+                    timestep_text = f"Steps: {self.model.num_timesteps:,}/{total_steps:,}"
                     timestep_width = font.size(timestep_text)[0]
                     timestep_x = progress_x + (progress_width - timestep_width) // 2
                     

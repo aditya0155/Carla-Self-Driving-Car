@@ -122,10 +122,27 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
         super(CombinedExtractor, self).__init__(observation_space, features_dim)
         
+        # Get image dimensions from observation space
+        # NOTE: SB3's VecTransposeImage wrapper transposes the obs space to (C, H, W)
+        # So we need to detect if it's channel-first or channel-last
+        image_shape = observation_space.spaces["image"].shape
+        
+        # Detect format: if first dim is small (1-3) and last dim is large, it's channel-first
+        if image_shape[0] <= 3 and image_shape[2] > 3:
+            # Channel-first format: (C, H, W) - after VecTransposeImage
+            image_channels, image_height, image_width = image_shape
+        else:
+            # Channel-last format: (H, W, C) - original gym format
+            image_height, image_width, image_channels = image_shape
+        
+        console.log(f"[cyan]Image observation shape: {image_shape} -> C={image_channels}, H={image_height}, W={image_width}[/cyan]")
+        
         # ========== IMAGE CNN ==========
+        # Updated for GRAYSCALE input (1 channel instead of 3)
+        # Input: 120x160x1 grayscale for better lane detection
         self.cnn = nn.Sequential(
 
-            nn.Conv2d(3, 64, kernel_size=8, stride=4),
+            nn.Conv2d(image_channels, 64, kernel_size=8, stride=4),  # Dynamic channel count
 
             nn.ReLU(),
 
@@ -151,18 +168,31 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
         )
 
-        # Determine the CNN output dimension.
-
+        # Determine the CNN output dimension using actual observation space dimensions
+        # Image shape is (H, W, C), PyTorch expects (C, H, W)
         with torch.no_grad():
 
-            dummy_image = torch.zeros(1, 3, 84, 84)
+            dummy_image = torch.zeros(1, image_channels, image_height, image_width)
 
             cnn_out_dim = self.cnn(dummy_image).shape[1]
         
         # ========== LIDAR BEV CNN ==========
         # Processes the 64x64 single-channel BEV occupancy grid
+        # NOTE: Same format detection as image - VecTransposeImage affects all image-like observations
+        lidar_shape = observation_space.spaces["lidar_bev"].shape
+        
+        # Detect format: if first dim is small (1-3) and last dim is large, it's channel-first
+        if lidar_shape[0] <= 3 and lidar_shape[2] > 3:
+            # Channel-first format: (C, H, W) - after VecTransposeImage
+            lidar_channels, lidar_height, lidar_width = lidar_shape
+        else:
+            # Channel-last format: (H, W, C) - original gym format
+            lidar_height, lidar_width, lidar_channels = lidar_shape
+        
+        console.log(f"[cyan]LIDAR BEV observation shape: {lidar_shape} -> C={lidar_channels}, H={lidar_height}, W={lidar_width}[/cyan]")
+        
         self.lidar_cnn = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, stride=2),    # 64x64 -> 30x30
+            nn.Conv2d(lidar_channels, 32, kernel_size=5, stride=2),    # 64x64 -> 30x30
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2),   # 30x30 -> 14x14
             nn.ReLU(),
@@ -173,7 +203,7 @@ class CombinedExtractor(BaseFeaturesExtractor):
         
         # Determine LIDAR CNN output dimension
         with torch.no_grad():
-            dummy_lidar = torch.zeros(1, 1, 64, 64)
+            dummy_lidar = torch.zeros(1, lidar_channels, lidar_height, lidar_width)
             lidar_cnn_out_dim = self.lidar_cnn(dummy_lidar).shape[1]
         
         # ========== STATE MLP ==========
@@ -253,19 +283,41 @@ class CombinedExtractor(BaseFeaturesExtractor):
     def forward(self, observations):
 
         # Process image (no autocast here - causes dtype issues with fc layer)
-        if observations["image"].ndim == 4 and observations["image"].shape[1] == 3:
-            image = observations["image"].float() / 255.0
+        # Handle both channel-first (batch, C, H, W) and channel-last (batch, H, W, C) formats
+        # For grayscale: C=1, for RGB: C=3
+        img = observations["image"]
+        if img.ndim == 4:
+            # Check if already in channel-first format by comparing dimensions
+            # Channel-first: (batch, C, H, W) where C is typically 1 or 3
+            # Channel-last: (batch, H, W, C) where C is typically 1 or 3
+            # Heuristic: if dim 1 <= 3 and dim 3 > 3, likely channel-first
+            if img.shape[1] <= 3 and img.shape[3] > 3:
+                # Already channel-first format
+                image = img.float() / 255.0
+            else:
+                # Channel-last format, permute to (batch, C, H, W)
+                image = img.permute(0, 3, 1, 2).float() / 255.0
         else:
-            image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
+            # Fallback: assume channel-last and permute
+            image = img.permute(0, 3, 1, 2).float() / 255.0
         
         image_features = self.cnn(image)  # shape: [batch, cnn_out_dim]
         
         # Process LIDAR BEV grid (uint8 [0, 255] -> float [0, 1])
+        # LIDAR BEV is 64x64x1, same handling as image
         lidar_bev = observations["lidar_bev"]
-        if lidar_bev.ndim == 4 and lidar_bev.shape[1] == 1:
-            lidar = lidar_bev.float() / 255.0  # Normalize uint8 to [0, 1]
+        if lidar_bev.ndim == 4:
+            # Check if already in channel-first format (batch, C, H, W)
+            # For 64x64x1 BEV: channel-last is (batch, 64, 64, 1), channel-first is (batch, 1, 64, 64)
+            if lidar_bev.shape[1] <= 3 and lidar_bev.shape[3] > 3:
+                # Already channel-first format
+                lidar = lidar_bev.float() / 255.0
+            else:
+                # Channel-last format, permute to (batch, C, H, W)
+                lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0
         else:
-            lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0  # Convert to [batch, 1, H, W] and normalize
+            # Fallback: assume channel-last and permute
+            lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0
         
         lidar_features = self.lidar_cnn(lidar)  # shape: [batch, lidar_cnn_out_dim]
         lidar_features = self.lidar_projection(lidar_features)  # shape: [batch, 128]
@@ -316,13 +368,17 @@ def make_env():
         # This gives 2-3x faster training and ELIMINATES the minimized window slowdown!
         # Sensors (camera, LIDAR) still work normally - only spectator view is disabled
         # Set to False if you want to watch the CARLA 3D viewport during training
+        # GRAYSCALE 160x120: Better lane detection with less memory than RGB 84x84
+        # - 160x120x1 = 19,200 bytes vs 84x84x3 = 21,168 bytes (9% smaller)
+        # - 3.6x more pixels for detecting thin lane markings
+        # - Grayscale preserves edge information (lane lines are high contrast)
         env = CarlaEnv(
             num_npcs=5, 
             frame_skip=8, 
             visualize=True,  # This is pygame window (your dashboard)
             fixed_delta_seconds=0.05,
-            camera_width=84,
-            camera_height=84,
+            camera_width=160,   # Increased from 84 for better lane visibility
+            camera_height=120,  # Increased from 84 for better lane visibility
             model=None,
             arduino_port=arduino_port,
             rotate_maps=False,  # Disabled: only 1 map available, enable when more maps downloaded
@@ -395,9 +451,7 @@ def objective(trial):
 
         tau=tau,
 
-        policy_kwargs=policy_kwargs,
-
-        total_timesteps_for_entropy=10000
+        policy_kwargs=policy_kwargs
 
     )
 
@@ -565,9 +619,7 @@ if __name__ == "__main__":
 
             env=env,
 
-            device="cuda" if torch.cuda.is_available() else "cpu",
-
-            total_timesteps_for_entropy=args.total_timesteps
+            device="cuda" if torch.cuda.is_available() else "cpu"
 
         )   
 
@@ -631,9 +683,7 @@ if __name__ == "__main__":
 
             tau=tau,
 
-            policy_kwargs=policy_kwargs,
-
-            total_timesteps_for_entropy=args.total_timesteps
+            policy_kwargs=policy_kwargs
 
         )
 

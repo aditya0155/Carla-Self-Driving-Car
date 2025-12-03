@@ -351,7 +351,7 @@ class CustomSAC(SAC):
         }
         
         # Get neural network params to save via PyTorch
-        state_dicts, pytorch_variables = self._get_torch_save_params()
+        state_dicts, self.use_augmentation = Truepytorch_variables = self._get_torch_save_params()
         params_to_save = {}
         for name in state_dicts:
             attr = recursive_getattr(self, name)
@@ -878,13 +878,6 @@ class CarlaEnv(gym.Env):
         
         # Image augmentation flag (enabled during training for robustness)
         self.use_augmentation = True
-
-        # Image logging settings - save every CNN observation image
-        self.image_log_dir = r"C:\Users\adity\Videos\carla\Carla-Self-Driving-Car\image_log"
-        self.step_counter = 0  # Global step counter for image naming
-        # Create image log directory if it doesn't exist
-        os.makedirs(self.image_log_dir, exist_ok=True)
-        console.log(f"[green]Image logging enabled: {self.image_log_dir}[/green]")
 
         self.spawn_npcs()
 

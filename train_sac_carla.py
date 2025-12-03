@@ -416,11 +416,11 @@ class CombinedExtractor(BaseFeaturesExtractor):
             lidar_cnn_out_dim = self.lidar_cnn(dummy_lidar).shape[1]
         
         # ========== STATE MLP ==========
-        state_dim = observation_space.spaces["state"].shape[0]  # dynamically determined (currently 5)
-        # State features: 102 (5% of total 2048)
-        state_features_dim = 102
+        state_dim = observation_space.spaces["state"].shape[0]  # dynamically determined (currently 4)
+        # State features: 60 (~2.9% of total 2048)
+        state_features_dim = 60
         
-        # MLP for state: maps 5D state to 102 features
+        # MLP for state: maps 4D state to 60 features
         self.mlp = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.ReLU(),
@@ -429,30 +429,30 @@ class CombinedExtractor(BaseFeaturesExtractor):
         )
 
         
-        # ========== FUSION LAYERS (LIDAR-BIASED: 50% Camera, 45% LIDAR, 5% State) ==========
+        # ========== FUSION LAYERS (CAMERA-BIASED: 54% Camera, 43% LIDAR, 3% State) ==========
         # 
-        # Feature distribution optimized for obstacle avoidance with LIDAR!
+        # Feature distribution optimized for lane following with camera!
         # 
         # Total: 2048 features
-        # - Camera:  1024 features (50%) - lane following, road texture
-        # - LIDAR:    922 features (45%) - obstacle detection, spatial awareness
-        # - State:    102 features (5%)  - speed, position, heading
+        # - Camera:  1106 features (54.0%) - lane following, road texture, visual cues
+        # - LIDAR:    882 features (43.1%) - obstacle detection, spatial awareness
+        # - State:     60 features (2.9%)  - speed, position, heading
         # 
-        # LIDAR is nearly equal to camera for better obstacle avoidance!
+        # Camera boosted for better lane detection while maintaining solid LIDAR coverage
         
-        # Camera bottleneck: compress 4096 → 1024 features (50%)
-        camera_features_dim = 1024
+        # Camera bottleneck: compress 4096 → 1106 features (54%)
+        camera_features_dim = 1106
         self.camera_bottleneck = nn.Sequential(
             nn.Linear(cnn_out_dim, camera_features_dim),
             nn.ReLU()
         )
         
-        # Attention layer: camera (1024) guides state importance
+        # Attention layer: camera (1106) guides state importance (60 features)
         self.attention_layer = nn.Linear(camera_features_dim, state_features_dim)
         
-        # LIDAR feature expansion: expand to 922 features (45%)
-        # This gives LIDAR almost as much influence as camera!
-        lidar_features_dim = 922
+        # LIDAR feature projection: project to 882 features (43.1%)
+        # Still substantial for obstacle avoidance!
+        lidar_features_dim = 882
         self.lidar_projection = nn.Sequential(
             nn.Linear(lidar_cnn_out_dim, 256),
             nn.ReLU(),
@@ -460,19 +460,19 @@ class CombinedExtractor(BaseFeaturesExtractor):
             nn.ReLU()
         )
         
-        # Combined: camera + state + lidar = 1024 + 102 + 922 = 2048
+        # Combined: camera + state + lidar = 1106 + 60 + 882 = 2048
         combined_dim = camera_features_dim + state_features_dim + lidar_features_dim
 
-        # Log the LIDAR-biased feature distribution
+        # Log the camera-biased feature distribution
         console.log(f"[bold green]╔═══════════════════════════════════════════════════════╗[/bold green]")
-        console.log(f"[bold green]║   FEATURE DISTRIBUTION (LIDAR-BIASED FOR SAFETY)      ║[/bold green]")
+        console.log(f"[bold green]║   FEATURE DISTRIBUTION (54% Cam, 43% LIDAR, 3% State) ║[/bold green]")
         console.log(f"[bold green]╠═══════════════════════════════════════════════════════╣[/bold green]")
-        console.log(f"[green]║ Camera:  {camera_features_dim:>5} features ({100*camera_features_dim/combined_dim:.1f}%) - bottleneck[/green]")
-        console.log(f"[green]║ LIDAR:   {lidar_features_dim:>5} features ({100*lidar_features_dim/combined_dim:.1f}%) - EXPANDED![/green]")
-        console.log(f"[green]║ State:   {state_features_dim:>5} features ({100*state_features_dim/combined_dim:.1f}%) - MLP[/green]")
+        console.log(f"[green]║ Camera:  {camera_features_dim:>5} features ({100*camera_features_dim/combined_dim:.1f}%) - BOOSTED![/green]")
+        console.log(f"[green]║ LIDAR:   {lidar_features_dim:>5} features ({100*lidar_features_dim/combined_dim:.1f}%) - projection[/green]")
+        console.log(f"[green]║ State:   {state_features_dim:>5} features ({100*state_features_dim/combined_dim:.1f}%) - MLP (4 scalars)[/green]")
         console.log(f"[bold green]╠═══════════════════════════════════════════════════════╣[/bold green]")
         console.log(f"[bold cyan]║ TOTAL:   {combined_dim:>5} features (100.0%)[/bold cyan]")
-        console.log(f"[bold green]║ LIDAR boosted for better obstacle avoidance!          ║[/bold green]")
+        console.log(f"[bold green]║ Camera boosted for better lane following!             ║[/bold green]")
         console.log(f"[bold green]╚═══════════════════════════════════════════════════════╝[/bold green]")
 
         # Two-stage FC to reduce parameters: 2048 -> 512 -> features_dim
@@ -547,9 +547,9 @@ class CombinedExtractor(BaseFeaturesExtractor):
 
 
     def forward(self, observations):
-        # ========== LIDAR-BIASED FEATURE EXTRACTION ==========
-        # Feature distribution: Camera 50% (1024), LIDAR 45% (922), State 5% (102)
-        # Total: 2048 features optimized for obstacle avoidance!
+        # ========== CAMERA-BIASED FEATURE EXTRACTION ==========
+        # Feature distribution: Camera 54% (1106), LIDAR 43% (882), State 3% (60)
+        # Total: 2048 features optimized for lane following!
         
         # Process image (no autocast here - causes dtype issues with fc layer)
         # Handle both channel-first (batch, C, H, W) and channel-last (batch, H, W, C) formats
@@ -570,9 +570,9 @@ class CombinedExtractor(BaseFeaturesExtractor):
             # Fallback: assume channel-last and permute
             image = img.permute(0, 3, 1, 2).float() / 255.0
         
-        # Camera CNN → bottleneck (4096 → 1024 features, 50%)
+        # Camera CNN → bottleneck (4096 → 1106 features, 54%)
         raw_image_features = self.cnn(image)  # shape: [batch, 4096]
-        image_features = self.camera_bottleneck(raw_image_features)  # shape: [batch, 1024]
+        image_features = self.camera_bottleneck(raw_image_features)  # shape: [batch, 1106]
         
         # Process LIDAR BEV grid (uint8 [0, 255] -> float [0, 1])
         # LIDAR BEV is 64x64x1, same handling as image
@@ -590,19 +590,19 @@ class CombinedExtractor(BaseFeaturesExtractor):
             # Fallback: assume channel-last and permute
             lidar = lidar_bev.permute(0, 3, 1, 2).float() / 255.0
         
-        # LIDAR CNN → projection (raw → 922 features, 45%)
+        # LIDAR CNN → projection (raw → 882 features, 43%)
         raw_lidar_features = self.lidar_cnn(lidar)  # shape: [batch, lidar_cnn_out_dim]
-        lidar_features = self.lidar_projection(raw_lidar_features)  # shape: [batch, 922]
+        lidar_features = self.lidar_projection(raw_lidar_features)  # shape: [batch, 882]
         
-        # Process state (102 features, 5%)
-        state_features = self.mlp(observations["state"].float())  # shape: [batch, 102]
+        # Process state (60 features, ~3%)
+        state_features = self.mlp(observations["state"].float())  # shape: [batch, 60]
         
-        # Attention-weighted fusion (bottlenecked camera 1024 → guides state 102)
-        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 102]
+        # Attention-weighted fusion (bottlenecked camera 1106 → guides state 60)
+        attn_weights = torch.sigmoid(self.attention_layer(image_features))  # shape: [batch, 60]
         fused_state = state_features * attn_weights
         
         # Concatenate all features: camera + state (attention-weighted) + lidar
-        # Total: 1024 + 102 + 922 = 2048 features (LIDAR-biased for safety!)
+        # Total: 1106 + 60 + 882 = 2048 features (Camera-biased for lane following!)
         concatenated = torch.cat([image_features, fused_state, lidar_features], dim=1)
 
         concatenated = torch.nan_to_num(concatenated, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -951,7 +951,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=70000,  # Reduced from 50k to 35k (compensates for larger 128x128 images)
+            buffer_size=70000,  # 70k transitions (~2.8GB RAM, ~700MB compressed on disk)
 
             # Note: optimize_memory_usage not supported with Dict observation spaces
 

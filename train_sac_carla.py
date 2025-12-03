@@ -43,6 +43,59 @@ new_logger = configure("./sac_tensorboard/", ["stdout", "csv", "tensorboard"])
 from stable_baselines3.common.callbacks import BaseCallback
 
 
+# Learning Rate Schedule Callback - decays LR from 3e-4 to 1.5e-4 over 300k steps
+class FixedScheduleLRCallback(BaseCallback):
+    """
+    Decays learning rate from initial to final over a fixed number of steps.
+    
+    LR Schedule: 3e-4 → 1.5e-4 over 300k steps
+    After 300k steps, LR stays constant at 1.5e-4.
+    
+    This is independent of total_timesteps passed to learn().
+    Works for infinite training!
+    
+    Note: Only updates actor and critic LR. Entropy coefficient uses its own
+    optimizer with separate LR (auto-tuned based on entropy objective).
+    """
+    
+    def __init__(self, initial_lr: float = 3e-4, final_lr: float = 1.5e-4, 
+                 schedule_steps: int = 300_000, log_interval: int = 10000, verbose: int = 1):
+        super().__init__(verbose)
+        self.initial_lr = initial_lr
+        self.final_lr = final_lr
+        self.schedule_steps = schedule_steps
+        self.log_interval = log_interval
+    
+    def _on_step(self) -> bool:
+        # Calculate progress (capped at 1.0 for steps beyond schedule)
+        progress = min(1.0, self.num_timesteps / self.schedule_steps)
+        
+        # Linear interpolation: initial_lr → final_lr
+        new_lr = self.initial_lr - (self.initial_lr - self.final_lr) * progress
+        
+        # Update actor optimizer LR
+        for param_group in self.model.actor.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        
+        # Update critic optimizer LR
+        for param_group in self.model.critic.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        
+        # Note: Entropy coefficient optimizer (ent_coef_optimizer) is NOT updated
+        # It uses its own LR and auto-tunes based on entropy objective
+        
+        # Log LR periodically
+        if self.verbose > 0 and self.num_timesteps % self.log_interval == 0:
+            lr_progress_pct = progress * 100
+            print(f"[LR Schedule] Step {self.num_timesteps}: LR = {new_lr:.6f} "
+                  f"(progress: {lr_progress_pct:.1f}% of 300k)")
+        
+        # Record to TensorBoard
+        if self.logger is not None:
+            self.logger.record("train/learning_rate", new_lr)
+        
+        return True
+
 
 class EntropyLoggingCallback(BaseCallback):
 
@@ -75,6 +128,76 @@ class EntropyLoggingCallback(BaseCallback):
             print(f"[INFO] Step {self.n_calls}: Entropy Coefficient = {current_ent_coef:.4f}")
 
         return True
+
+
+# Replay Buffer Checkpoint Callback - saves full checkpoint every 10k steps
+class ReplayBufferCheckpointCallback(BaseCallback):
+    """
+    Saves replay buffer alongside model checkpoints.
+    
+    This enables seamless resume of training without losing experience.
+    The replay buffer is saved with LZMA compression to reduce file size
+    from ~3-4 GB to ~1-1.5 GB.
+    
+    Args:
+        save_freq: How often to save (default: 10000 steps)
+        save_path: Directory to save checkpoints
+        name_prefix: Prefix for checkpoint files
+        verbose: Verbosity level
+    """
+    
+    def __init__(self, save_freq: int = 10000, save_path: str = './checkpoints/', 
+                 name_prefix: str = 'sac_carla', verbose: int = 1):
+        super().__init__(verbose)
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+        self.last_save_step = 0
+    
+    def _init_callback(self) -> None:
+        # Create save directory if it doesn't exist
+        if self.save_path is not None:
+            os.makedirs(self.save_path, exist_ok=True)
+    
+    def _on_step(self) -> bool:
+        # Only save at save_freq intervals
+        if self.num_timesteps - self.last_save_step >= self.save_freq:
+            self.last_save_step = self.num_timesteps
+            
+            # Construct paths
+            checkpoint_path = os.path.join(
+                self.save_path, 
+                f"{self.name_prefix}_{self.num_timesteps}_steps"
+            )
+            replay_buffer_path = os.path.join(
+                self.save_path,
+                f"{self.name_prefix}_{self.num_timesteps}_steps_replay_buffer"
+            )
+            
+            # Save model (weights, hyperparams)
+            self.model.save(checkpoint_path)
+            
+            # Save replay buffer with compression
+            if hasattr(self.model, 'save_replay_buffer'):
+                try:
+                    self.model.save_replay_buffer(replay_buffer_path, use_compression=True)
+                    if self.verbose > 0:
+                        console.log(f"[bold green]Full checkpoint saved at step {self.num_timesteps:,}[/bold green]")
+                        console.log(f"[green]  Model: {checkpoint_path}.zip[/green]")
+                        console.log(f"[green]  Replay Buffer: {replay_buffer_path}.pkl.xz[/green]")
+                except Exception as e:
+                    console.log(f"[red]Error saving replay buffer: {e}[/red]")
+            else:
+                if self.verbose > 0:
+                    console.log(f"[yellow]Model saved but replay buffer save not available[/yellow]")
+        
+        return True
+    
+    def _on_training_start(self) -> None:
+        """Initialize last_save_step based on current timesteps (for resume)."""
+        if hasattr(self.model, 'num_timesteps'):
+            # Round down to nearest save_freq to avoid double-saving
+            self.last_save_step = (self.model.num_timesteps // self.save_freq) * self.save_freq
 
 
 
@@ -575,7 +698,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint/model file to resume training from")
 
-    parser.add_argument("--total_timesteps", type=int, default=150000, help="Total timesteps for training")
+    parser.add_argument("--total_timesteps", type=int, default=None, help="Total timesteps for training (default: infinite, use Ctrl+C to stop)")
 
     parser.add_argument("--optimize", action="store_true", help="Run hyperparameter optimization before training")
 
@@ -603,7 +726,7 @@ if __name__ == "__main__":
 
     else:
 
-        learning_rate = 2e-4
+        learning_rate = 3e-4  # Initial LR (will decay to 1.5e-4 via FixedScheduleLRCallback)
 
         batch_size = 512
 
@@ -773,22 +896,55 @@ if __name__ == "__main__":
 
 
     console.log("[bold green]Starting training...")
+    
+    # Create LR schedule callback (3e-4 → 1.5e-4 over 300k steps)
+    lr_schedule_callback = FixedScheduleLRCallback(
+        initial_lr=3e-4, 
+        final_lr=1.5e-4, 
+        schedule_steps=300_000,
+        log_interval=10000,
+        verbose=1
+    )
+    
+    # Create replay buffer checkpoint callback (full checkpoint every 10k steps)
+    # This saves both model weights AND replay buffer for seamless resume
+    replay_buffer_checkpoint_callback = ReplayBufferCheckpointCallback(
+        save_freq=10000,  # Save every 10k steps (vs 2k for lightweight model-only saves)
+        save_path='./checkpoints/',
+        name_prefix='sac_carla_full',
+        verbose=1
+    )
 
-    callbacks = [checkpoint_callback, loss_logging_callback, stuck_detection_callback, entropy_logging_callback]
+    callbacks = [checkpoint_callback, loss_logging_callback, stuck_detection_callback, entropy_logging_callback, lr_schedule_callback, replay_buffer_checkpoint_callback]
 
     # IMPORTANT: Set model reference BEFORE training so render() can access it
     env.envs[0].model = model
-
-    # When resuming, use remaining timesteps and don't reset the counter
-    if args.resume is not None and os.path.exists(args.resume):
-        remaining_timesteps = args.total_timesteps - model.num_timesteps
-        if remaining_timesteps <= 0:
-            console.log(f"[yellow]Model already trained for {model.num_timesteps} steps (target: {args.total_timesteps}). Nothing to do.[/yellow]")
-        else:
-            console.log(f"[cyan]Resuming training for {remaining_timesteps} more steps...[/cyan]")
-            model.learn(total_timesteps=remaining_timesteps, callback=callbacks, reset_num_timesteps=False)
+    
+    # Determine total timesteps for training
+    # If None (default), train infinitely until Ctrl+C
+    # The LR schedule is independent - it decays over 300k then stays constant
+    if args.total_timesteps is None:
+        total_timesteps = int(1e9)  # ~1 billion steps (effectively infinite)
+        console.log("[bold yellow]Training indefinitely (Ctrl+C to stop). LR decays over first 300k steps.[/bold yellow]")
     else:
-        model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
+        total_timesteps = args.total_timesteps
+        console.log(f"[cyan]Training for {total_timesteps:,} steps. LR decays over first 300k steps.[/cyan]")
+
+    # When resuming, continue from current timestep (don't reset counter)
+    if args.resume is not None and os.path.exists(args.resume):
+        if args.total_timesteps is not None:
+            remaining_timesteps = args.total_timesteps - model.num_timesteps
+            if remaining_timesteps <= 0:
+                console.log(f"[yellow]Model already trained for {model.num_timesteps} steps (target: {args.total_timesteps}). Nothing to do.[/yellow]")
+            else:
+                console.log(f"[cyan]Resuming training for {remaining_timesteps:,} more steps...[/cyan]")
+                model.learn(total_timesteps=remaining_timesteps, callback=callbacks, reset_num_timesteps=False)
+        else:
+            # Infinite training when resuming
+            console.log(f"[cyan]Resuming from step {model.num_timesteps:,}. Training indefinitely...[/cyan]")
+            model.learn(total_timesteps=total_timesteps, callback=callbacks, reset_num_timesteps=False)
+    else:
+        model.learn(total_timesteps=total_timesteps, callback=callbacks)
 
     model_path = "sac_carla_model_enhanced"
 

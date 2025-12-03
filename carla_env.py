@@ -1,4 +1,6 @@
 import os
+import pickle
+import lzma
 
 import gym 
 
@@ -290,29 +292,77 @@ class CustomSAC(SAC):
         # Environment contains unpicklable CARLA/pygame objects
         excluded.add("env")
         excluded.add("_vec_normalize_env")
+        excluded.add("_last_obs")  # May contain env references
+        excluded.add("_last_episode_starts")
         return excluded
 
     def save(self, path, exclude=None, include=None):
         """
         Save the model to a zip file, handling unpicklable CARLA environment.
         
-        Temporarily removes the env reference before saving, then restores it.
+        Uses a WHITELIST approach - only save explicitly safe data.
+        This guarantees no pickle errors from env/pygame/carla objects.
         """
-        # Store reference to env
-        env_backup = self.env
-        vec_normalize_backup = getattr(self, '_vec_normalize_env', None)
+        import pathlib
+        from stable_baselines3.common.save_util import recursive_getattr, save_to_zip_file
         
-        # Temporarily remove unpicklable objects
-        self.env = None
-        self._vec_normalize_env = None
+        # Build path
+        path = pathlib.Path(path)
+        if path.suffix == "":
+            path = path.with_suffix(".zip")
         
-        try:
-            # Call parent save
-            super().save(path, exclude=exclude, include=include)
-        finally:
-            # Restore env reference
-            self.env = env_backup
-            self._vec_normalize_env = vec_normalize_backup
+        # WHITELIST: Only save these specific, known-safe parameters
+        # These are the essential hyperparameters needed to reconstruct the model
+        safe_data = {
+            # Core algorithm params
+            "gamma": self.gamma,
+            "tau": self.tau,
+            "learning_rate": self.learning_rate,
+            "buffer_size": self.buffer_size,
+            "batch_size": self.batch_size,
+            "learning_starts": self.learning_starts,
+            "train_freq": self.train_freq,
+            "gradient_steps": self.gradient_steps,
+            "ent_coef": "auto",  # We use auto entropy
+            "target_update_interval": self.target_update_interval,
+            "target_entropy": getattr(self, 'target_entropy', 'auto'),
+            
+            # Spaces (these are picklable gym spaces)
+            "observation_space": self.observation_space,
+            "action_space": self.action_space,
+            
+            # Training state
+            "n_envs": self.n_envs,
+            "num_timesteps": self.num_timesteps,
+            "_total_timesteps": self._total_timesteps,
+            "_num_timesteps_at_start": getattr(self, '_num_timesteps_at_start', 0),
+            "_n_updates": self._n_updates,
+            "_episode_num": self._episode_num,
+            
+            # Policy config
+            "policy_class": self.policy_class,
+            "policy_kwargs": self.policy_kwargs if self.policy_kwargs else {},
+            
+            # Device (as string)
+            "device": str(self.device),
+            
+            # Custom SAC params
+            "fixed_target_entropy": getattr(self, 'fixed_target_entropy', -3.0),
+            "use_mixed_precision": getattr(self, 'use_mixed_precision', True),
+        }
+        
+        # Get neural network params to save via PyTorch
+        state_dicts, pytorch_variables = self._get_torch_save_params()
+        params_to_save = {}
+        for name in state_dicts:
+            attr = recursive_getattr(self, name)
+            params_to_save[name] = attr.state_dict()
+        for name in pytorch_variables:
+            attr = recursive_getattr(self, name)
+            params_to_save[name] = attr
+        
+        # Save to zip file - only safe_data, no risky objects
+        save_to_zip_file(path, data=safe_data, params=params_to_save, pytorch_variables=None)
 
     def _get_torch_save_params(self):
         """
@@ -326,16 +376,169 @@ class CustomSAC(SAC):
 
     
 
+    def save_replay_buffer(self, path, use_compression=True):
+        """
+        Save the replay buffer to a file.
+        
+        Args:
+            path: Path to save the replay buffer (will add .pkl.xz or .pkl extension)
+            use_compression: If True, use LZMA compression (~60-70% size reduction)
+        
+        The replay buffer contains all transitions (obs, action, reward, next_obs, done)
+        which are essential for continuing training without losing experience.
+        
+        File size estimate for 50k buffer with our observation space:
+        - Uncompressed: ~3-4 GB
+        - Compressed (LZMA): ~1-1.5 GB
+        """
+        import pathlib
+        
+        path = pathlib.Path(path)
+        
+        # Get buffer data to save
+        # We save the internal arrays directly for efficiency
+        buffer_data = {
+            'pos': self.replay_buffer.pos,
+            'full': self.replay_buffer.full,
+            'buffer_size': self.replay_buffer.buffer_size,
+            'observations': {},
+            'next_observations': {},
+            'actions': self.replay_buffer.actions[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
+            'rewards': self.replay_buffer.rewards[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
+            'dones': self.replay_buffer.dones[:self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size],
+        }
+        
+        # Save observations (Dict observation space)
+        actual_size = self.replay_buffer.pos if not self.replay_buffer.full else self.replay_buffer.buffer_size
+        for key in self.replay_buffer.observations.keys():
+            buffer_data['observations'][key] = self.replay_buffer.observations[key][:actual_size]
+            buffer_data['next_observations'][key] = self.replay_buffer.next_observations[key][:actual_size]
+        
+        # Calculate size for logging
+        total_transitions = actual_size
+        
+        if use_compression:
+            save_path = path.with_suffix('.pkl.xz')
+            console.log(f"[cyan]Saving replay buffer ({total_transitions:,} transitions) with LZMA compression...[/cyan]")
+            with lzma.open(save_path, 'wb', preset=3) as f:  # preset=3 is good balance of speed/compression
+                pickle.dump(buffer_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        else:
+            save_path = path.with_suffix('.pkl')
+            console.log(f"[cyan]Saving replay buffer ({total_transitions:,} transitions) uncompressed...[/cyan]")
+            with open(save_path, 'wb') as f:
+                pickle.dump(buffer_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # Get file size
+        file_size_mb = save_path.stat().st_size / (1024 * 1024)
+        console.log(f"[green]Replay buffer saved: {save_path} ({file_size_mb:.1f} MB)[/green]")
+        
+        return save_path
+    
+    def load_replay_buffer(self, path):
+        """
+        Load replay buffer from a file.
+        
+        Args:
+            path: Path to the replay buffer file (.pkl or .pkl.xz)
+        
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        import pathlib
+        
+        path = pathlib.Path(path)
+        
+        # Try both compressed and uncompressed paths
+        if path.suffix == '.xz':
+            compressed_path = path
+            uncompressed_path = path.with_suffix('')
+        elif path.suffix == '.pkl':
+            compressed_path = pathlib.Path(str(path) + '.xz')
+            uncompressed_path = path
+        else:
+            # Assume it's a base path, try both extensions
+            compressed_path = path.with_suffix('.pkl.xz')
+            uncompressed_path = path.with_suffix('.pkl')
+        
+        # Try compressed first (preferred), then uncompressed
+        load_path = None
+        use_compression = False
+        
+        if compressed_path.exists():
+            load_path = compressed_path
+            use_compression = True
+        elif uncompressed_path.exists():
+            load_path = uncompressed_path
+            use_compression = False
+        else:
+            console.log(f"[yellow]No replay buffer found at {path}[/yellow]")
+            return False
+        
+        try:
+            console.log(f"[cyan]Loading replay buffer from {load_path}...[/cyan]")
+            
+            if use_compression:
+                with lzma.open(load_path, 'rb') as f:
+                    buffer_data = pickle.load(f)
+            else:
+                with open(load_path, 'rb') as f:
+                    buffer_data = pickle.load(f)
+            
+            # Restore buffer state
+            actual_size = buffer_data['pos'] if not buffer_data['full'] else buffer_data['buffer_size']
+            
+            # Check if buffer sizes match
+            if buffer_data['buffer_size'] != self.replay_buffer.buffer_size:
+                console.log(f"[yellow]Buffer size mismatch: saved={buffer_data['buffer_size']}, current={self.replay_buffer.buffer_size}[/yellow]")
+                console.log(f"[yellow]Loading {min(actual_size, self.replay_buffer.buffer_size)} transitions[/yellow]")
+                actual_size = min(actual_size, self.replay_buffer.buffer_size)
+            
+            # Restore data
+            self.replay_buffer.pos = actual_size % self.replay_buffer.buffer_size
+            self.replay_buffer.full = buffer_data['full'] and (actual_size >= self.replay_buffer.buffer_size)
+            
+            # Restore arrays
+            self.replay_buffer.actions[:actual_size] = buffer_data['actions'][:actual_size]
+            self.replay_buffer.rewards[:actual_size] = buffer_data['rewards'][:actual_size]
+            self.replay_buffer.dones[:actual_size] = buffer_data['dones'][:actual_size]
+            
+            # Restore observations (Dict observation space)
+            for key in buffer_data['observations'].keys():
+                if key in self.replay_buffer.observations:
+                    self.replay_buffer.observations[key][:actual_size] = buffer_data['observations'][key][:actual_size]
+                    self.replay_buffer.next_observations[key][:actual_size] = buffer_data['next_observations'][key][:actual_size]
+            
+            file_size_mb = load_path.stat().st_size / (1024 * 1024)
+            console.log(f"[green]Replay buffer loaded: {actual_size:,} transitions ({file_size_mb:.1f} MB)[/green]")
+            return True
+            
+        except Exception as e:
+            console.log(f"[red]Error loading replay buffer: {e}[/red]")
+            import traceback
+            console.log(f"[red]{traceback.format_exc()}[/red]")
+            return False
+
     @classmethod
     def load(cls, path, env=None, device="auto", custom_objects=None, force_reset=True, 
-             use_mixed_precision=True, **kwargs):
+             use_mixed_precision=True, load_replay_buffer=True, **kwargs):
         """
         Load the model from a zip-file.
         
         Follows original SAC paper exactly:
         - Fixed target entropy H̄ = -dim(A) = -3.0
         - NO alpha clamping (α learned freely via gradient descent)
+        
+        Args:
+            path: Path to the model file
+            env: Environment to use
+            device: Device to load the model on
+            custom_objects: Custom objects to load
+            force_reset: Whether to force reset
+            use_mixed_precision: Whether to use mixed precision training
+            load_replay_buffer: Whether to auto-load replay buffer if found (default: True)
         """
+        import pathlib
+        
         model = super(CustomSAC, cls).load(path, env, device, custom_objects, **kwargs)
         
         # Fixed target entropy from paper: H̄ = -dim(A)
@@ -360,6 +563,21 @@ class CustomSAC(SAC):
         
         print(f"[LOAD] Resumed model - timesteps: {model.num_timesteps}, "
               f"α: {current_alpha:.4f}, target_H: {model.fixed_target_entropy:.3f} (fixed, no clamp)")
+        
+        # Auto-load replay buffer if found
+        if load_replay_buffer:
+            # Construct replay buffer path from model path
+            model_path = pathlib.Path(path)
+            # Remove .zip extension if present
+            base_path = model_path.with_suffix('') if model_path.suffix == '.zip' else model_path
+            replay_buffer_path = pathlib.Path(str(base_path) + '_replay_buffer')
+            
+            # Try to load replay buffer
+            if model.load_replay_buffer(replay_buffer_path):
+                console.log(f"[green]Successfully loaded replay buffer alongside model[/green]")
+            else:
+                console.log(f"[yellow]No replay buffer found - starting with empty buffer[/yellow]")
+                console.log(f"[yellow]Training will need {model.learning_starts} steps before learning starts[/yellow]")
 
         return model    
 

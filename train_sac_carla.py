@@ -720,7 +720,7 @@ def objective(trial):
 
         learning_rate=lr,
 
-        buffer_size=50000,
+        buffer_size=70000,
 
         # Note: optimize_memory_usage not supported with Dict observation spaces
 
@@ -798,7 +798,7 @@ if __name__ == "__main__":
 
     else:
 
-        learning_rate = 3e-4  # Initial LR (will decay to 1.5e-4 via FixedScheduleLRCallback)
+        learning_rate = 2e-4  # Static LR (no decay schedule)
 
         batch_size = 256  # Reduced from 512 to save VRAM (compensates for larger 128x128 images)
 
@@ -951,7 +951,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=35000,  # Reduced from 50k to 35k (compensates for larger 128x128 images)
+            buffer_size=70000,  # Reduced from 50k to 35k (compensates for larger 128x128 images)
 
             # Note: optimize_memory_usage not supported with Dict observation spaces
 
@@ -969,14 +969,8 @@ if __name__ == "__main__":
 
     console.log("[bold green]Starting training...")
     
-    # Create LR schedule callback (3e-4 → 1.5e-4 over 300k steps)
-    lr_schedule_callback = FixedScheduleLRCallback(
-        initial_lr=3e-4, 
-        final_lr=1.5e-4, 
-        schedule_steps=300_000,
-        log_interval=10000,
-        verbose=1
-    )
+    # Static LR: 2e-4 (no decay schedule)
+    # LR schedule callback removed - using constant learning rate
     
     # Create replay buffer checkpoint callback (full checkpoint every 10k steps)
     # This saves both model weights AND replay buffer for seamless resume
@@ -989,7 +983,7 @@ if __name__ == "__main__":
         verbose=1
     )
 
-    callbacks = [checkpoint_callback, loss_logging_callback, stuck_detection_callback, entropy_logging_callback, lr_schedule_callback, replay_buffer_checkpoint_callback]
+    callbacks = [checkpoint_callback, loss_logging_callback, stuck_detection_callback, entropy_logging_callback, replay_buffer_checkpoint_callback]
 
     # IMPORTANT: Set model reference BEFORE training so render() can access it
     env.envs[0].model = model
@@ -999,10 +993,10 @@ if __name__ == "__main__":
     # The LR schedule is independent - it decays over 300k then stays constant
     if args.total_timesteps is None:
         total_timesteps = int(1e9)  # ~1 billion steps (effectively infinite)
-        console.log("[bold yellow]Training indefinitely (Ctrl+C to stop). LR decays over first 300k steps.[/bold yellow]")
+        console.log("[bold yellow]Training indefinitely (Ctrl+C to stop). Static LR = 2e-4.[/bold yellow]")
     else:
         total_timesteps = args.total_timesteps
-        console.log(f"[cyan]Training for {total_timesteps:,} steps. LR decays over first 300k steps.[/cyan]")
+        console.log(f"[cyan]Training for {total_timesteps:,} steps. Static LR = 2e-4.[/cyan]")
 
     # When resuming, continue from current timestep (don't reset counter)
     if args.resume is not None and os.path.exists(args.resume):

@@ -351,7 +351,7 @@ class CustomSAC(SAC):
         }
         
         # Get neural network params to save via PyTorch
-        state_dicts, self.use_augmentation = Truepytorch_variables = self._get_torch_save_params()
+        state_dicts, pytorch_variables = self._get_torch_save_params()
         params_to_save = {}
         for name in state_dicts:
             attr = recursive_getattr(self, name)
@@ -1615,8 +1615,6 @@ class CarlaEnv(gym.Env):
         Process FORWARD-FACING camera image for CNN observations.
         This camera is hood-level, looking forward (dashcam style).
         Used for the 84x84 grayscale observation sent to the policy network.
-        
-        Every image is saved to image_log_dir for analysis/debugging.
         """
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = array.reshape((image.height, image.width, 4))  # BGRA format

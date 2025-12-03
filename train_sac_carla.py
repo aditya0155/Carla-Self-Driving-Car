@@ -525,7 +525,7 @@ def objective(trial):
 
         learning_rate=lr,
 
-        buffer_size=22000,
+        buffer_size=30000,
 
         # Note: optimize_memory_usage not supported with Dict observation spaces
 
@@ -620,7 +620,7 @@ if __name__ == "__main__":
     policy_kwargs = dict(
         features_extractor_class=CombinedExtractor,
         features_extractor_kwargs=dict(features_dim=256),  # Match paper's network size
-        net_arch=dict(pi=[256, 256], qf=[256, 256]),  # Paper: 2 hidden layers, 256 units each
+        net_arch=dict(pi=[256, 512], qf=[256, 512]),  # Larger second layer for more capacity
         
         # CRITICAL: Share feature extractor between actor and critics
         # Without this, SB3 creates 3 separate extractors (1 actor + 2 critics)
@@ -756,7 +756,7 @@ if __name__ == "__main__":
 
             learning_rate=learning_rate,
 
-            buffer_size=15000,  # Reduced from 30000 to save ~600MB RAM
+            buffer_size=30000,  # Reduced from 30000 to save ~600MB RAM
 
             # Note: optimize_memory_usage not supported with Dict observation spaces
 

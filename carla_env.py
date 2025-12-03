@@ -281,7 +281,7 @@ class CustomSAC(SAC):
         GradScaler contains _thread.RLock which cannot be pickled.
         We exclude it and recreate it on load.
         """
-        excluded = super()._excluded_save_params()
+        excluded = set(super()._excluded_save_params())
         # Add our custom non-picklable attributes
         # GradScaler has thread locks that can't be pickled
         excluded.add("scaler")

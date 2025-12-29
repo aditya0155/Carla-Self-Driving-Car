@@ -612,11 +612,21 @@ class CustomSAC(SAC):
             # We need to match what SB3 will create after wrapping
             # VecTransposeImage transposes Dict spaces with image observations from (H, W, C) to (C, H, W)
             from gym import spaces as gym_spaces
+            # Also import gymnasium spaces (SB3 uses gymnasium now)
+            try:
+                import gymnasium
+                gymnasium_Dict = gymnasium.spaces.Dict
+                gymnasium_Box = gymnasium.spaces.Box
+            except ImportError:
+                gymnasium_Dict = None
+                gymnasium_Box = None
             
             console.log(f"[cyan]Base obs space type: {type(base_obs_space)}, value: {base_obs_space}[/cyan]")
             
             # Create the transposed observation space to match what SB3 expects after VecTransposeImage
-            if isinstance(base_obs_space, gym_spaces.Dict):
+            # Check for both gym.spaces.Dict and gymnasium.spaces.Dict
+            is_dict_space = isinstance(base_obs_space, gym_spaces.Dict) or (gymnasium_Dict and isinstance(base_obs_space, gymnasium_Dict))
+            if is_dict_space:
                 transposed_spaces = {}
                 for key, space in base_obs_space.spaces.items():
                     console.log(f"[cyan]Processing key '{key}': type={type(space)}, shape={space.shape if hasattr(space, 'shape') else 'N/A'}[/cyan]")

@@ -915,12 +915,6 @@ if __name__ == "__main__":
 
         
 
-        # Calculate the remaining timesteps
-
-        remaining_timesteps = args.total_timesteps - model.num_timesteps
-
-        
-
         # Log the current state (check log_ent_coef first for auto entropy mode)
 
         if hasattr(model, 'log_ent_coef') and model.log_ent_coef is not None:
@@ -934,8 +928,6 @@ if __name__ == "__main__":
         console.log(f"[cyan]Current entropy coefficient: {current_alpha:.4f}[/cyan]")
 
         console.log(f"[cyan]Current timesteps: {model.num_timesteps}[/cyan]")
-
-        console.log(f"[cyan]Remaining timesteps: {remaining_timesteps}[/cyan]")
 
     else:
 
@@ -1014,8 +1006,8 @@ if __name__ == "__main__":
                 console.log(f"[cyan]Resuming training for {remaining_timesteps:,} more steps...[/cyan]")
                 model.learn(total_timesteps=remaining_timesteps, callback=callbacks, reset_num_timesteps=False)
         else:
-            # Infinite training when resuming
-            console.log(f"[cyan]Resuming from step {model.num_timesteps:,}. Training indefinitely...[/cyan]")
+            # Infinite training when resuming (args.total_timesteps is None)
+            console.log(f"[cyan]Resuming from step {model.num_timesteps:,}. Training indefinitely (Ctrl+C to stop)...[/cyan]")
             model.learn(total_timesteps=total_timesteps, callback=callbacks, reset_num_timesteps=False)
     else:
         model.learn(total_timesteps=total_timesteps, callback=callbacks)

@@ -692,11 +692,33 @@ class CustomSAC(SAC):
             data["policy_kwargs"] = {}
             fields_were_missing = True
         
-        # Fix train_freq format: SB3 expects (frequency, unit) tuple, not list
-        if "train_freq" in data and isinstance(data["train_freq"], list):
-            data["train_freq"] = tuple(data["train_freq"])
-            fields_were_missing = True  # Force patched checkpoint creation
-            console.log(f"[yellow]Converted train_freq from list to tuple: {data['train_freq']}[/yellow]")
+        # Fix train_freq format: SB3 expects (frequency, unit) tuple like (1, "step")
+        # Old checkpoints may have it as list [1, 'step'] or nested [[1, 'step']] etc.
+        if "train_freq" in data:
+            tf = data["train_freq"]
+            console.log(f"[cyan]Original train_freq: {tf}, type: {type(tf)}[/cyan]")
+            # Handle various formats and convert to proper (int, str) tuple
+            if isinstance(tf, (list, tuple)):
+                # If it's nested like [[1, 'step']], flatten it
+                while isinstance(tf, (list, tuple)) and len(tf) == 1 and isinstance(tf[0], (list, tuple)):
+                    tf = tf[0]
+                # Now tf should be [1, 'step'] or (1, 'step')
+                if len(tf) == 2:
+                    freq, unit = tf
+                    # Ensure freq is int and unit is str
+                    data["train_freq"] = (int(freq), str(unit))
+                    fields_were_missing = True
+                    console.log(f"[yellow]Converted train_freq to: {data['train_freq']}[/yellow]")
+                else:
+                    # Unknown format, use default
+                    data["train_freq"] = (1, "step")
+                    fields_were_missing = True
+                    console.log(f"[yellow]Unknown train_freq format, using default: (1, 'step')[/yellow]")
+            else:
+                # Not a list/tuple, use default
+                data["train_freq"] = (1, "step")
+                fields_were_missing = True
+                console.log(f"[yellow]Invalid train_freq type, using default: (1, 'step')[/yellow]")
         
         # If spaces or other required fields were missing, we need to create a patched checkpoint file
         # because SB3's load() reads directly from the zip file

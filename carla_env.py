@@ -692,6 +692,12 @@ class CustomSAC(SAC):
             data["policy_kwargs"] = {}
             fields_were_missing = True
         
+        # Fix train_freq format: SB3 expects (frequency, unit) tuple, not list
+        if "train_freq" in data and isinstance(data["train_freq"], list):
+            data["train_freq"] = tuple(data["train_freq"])
+            fields_were_missing = True  # Force patched checkpoint creation
+            console.log(f"[yellow]Converted train_freq from list to tuple: {data['train_freq']}[/yellow]")
+        
         # If spaces or other required fields were missing, we need to create a patched checkpoint file
         # because SB3's load() reads directly from the zip file
         if spaces_were_missing or fields_were_missing:

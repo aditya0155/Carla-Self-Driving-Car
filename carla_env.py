@@ -345,9 +345,19 @@ class CustomSAC(SAC):
             # Device (as string)
             "device": str(self.device),
             
+            # SB3 required params (must be present for load() to work)
+            "verbose": int(getattr(self, 'verbose', 1)),
+            "policy_class": self.policy_class,
+            "policy_kwargs": self.policy_kwargs if self.policy_kwargs is not None else {},
+            
             # Custom SAC params (primitives)
             "fixed_target_entropy": float(getattr(self, 'fixed_target_entropy', -3.0)),
             "use_mixed_precision": bool(getattr(self, 'use_mixed_precision', True)),
+            
+            # Environment spaces (REQUIRED for load() to verify environment compatibility)
+            # These are gym.spaces objects which are picklable
+            "observation_space": self.observation_space,
+            "action_space": self.action_space,
         }
         
         # Get neural network params to save via PyTorch
@@ -364,7 +374,7 @@ class CustomSAC(SAC):
         save_to_zip_file(path, data=safe_data, params=params_to_save, pytorch_variables=None)
 
     def _get_torch_save_params(self):
-        """
+        """a
         Get the name of torch variables that will be saved with PyTorch's ``th.save``.
         
         Override to ensure scaler is not included in saved state.
@@ -558,7 +568,7 @@ class CustomSAC(SAC):
         
         Args:
             path: Path to the model file
-            env: Environment to use
+            env: Environment to use (REQUIRED - provides observation/action spaces)
             device: Device to load the model on
             custom_objects: Custom objects to load
             force_reset: Whether to force reset
@@ -566,8 +576,77 @@ class CustomSAC(SAC):
             load_replay_buffer: Whether to auto-load replay buffer if found (default: True)
         """
         import pathlib
+        import tempfile
+        from stable_baselines3.common.save_util import load_from_zip_file, save_to_zip_file
         
-        model = super(CustomSAC, cls).load(path, env, device, custom_objects, **kwargs)
+        # First, try to load the data to check if observation/action spaces exist
+        # If they don't exist (old checkpoint), we need to provide them from env
+        data, params, pytorch_variables = load_from_zip_file(path, device=device)
+        
+        # Check if spaces are missing from saved data
+        spaces_were_missing = False
+        if "observation_space" not in data or "action_space" not in data:
+            spaces_were_missing = True
+            console.log("[yellow]Checkpoint missing observation/action spaces - extracting from environment...[/yellow]")
+            if env is None:
+                raise ValueError(
+                    "Environment (env) must be provided when loading checkpoints that don't contain "
+                    "observation_space and action_space. Please pass env=your_env to load()."
+                )
+            # Get spaces from the environment (handles VecEnv wrappers)
+            if hasattr(env, 'observation_space'):
+                data["observation_space"] = env.observation_space
+            elif hasattr(env, 'envs') and len(env.envs) > 0:
+                data["observation_space"] = env.envs[0].observation_space
+            else:
+                raise ValueError("Could not extract observation_space from environment")
+            
+            if hasattr(env, 'action_space'):
+                data["action_space"] = env.action_space
+            elif hasattr(env, 'envs') and len(env.envs) > 0:
+                data["action_space"] = env.envs[0].action_space
+            else:
+                raise ValueError("Could not extract action_space from environment")
+            
+            console.log(f"[green]Spaces extracted: obs_space={data['observation_space']}, act_space={data['action_space']}[/green]")
+        
+        # Also ensure other required SB3 fields exist
+        fields_were_missing = False
+        if "verbose" not in data:
+            data["verbose"] = 1
+            fields_were_missing = True
+        if "policy_class" not in data:
+            # Import the policy class
+            from stable_baselines3.sac.policies import MultiInputPolicy
+            data["policy_class"] = MultiInputPolicy
+            fields_were_missing = True
+        if "policy_kwargs" not in data:
+            data["policy_kwargs"] = {}
+            fields_were_missing = True
+        
+        # If spaces or other required fields were missing, we need to create a patched checkpoint file
+        # because SB3's load() reads directly from the zip file
+        if spaces_were_missing or fields_were_missing:
+            # Create a temporary file with the complete data
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+            
+            # Save the patched data to the temp file
+            save_to_zip_file(tmp_path, data=data, params=params, pytorch_variables=pytorch_variables)
+            console.log(f"[cyan]Created patched checkpoint with spaces at {tmp_path}[/cyan]")
+            
+            # Load from the patched checkpoint
+            model = super(CustomSAC, cls).load(tmp_path, env=env, device=device, custom_objects=custom_objects, **kwargs)
+            
+            # Clean up temp file
+            try:
+                import os
+                os.unlink(tmp_path)
+            except:
+                pass
+        else:
+            # Spaces exist, load normally
+            model = super(CustomSAC, cls).load(path, env=env, device=device, custom_objects=custom_objects, **kwargs)
         
         # Fixed target entropy from paper: H̄ = -dim(A)
         model.fixed_target_entropy = -3.0

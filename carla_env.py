@@ -593,13 +593,46 @@ class CustomSAC(SAC):
                     "Environment (env) must be provided when loading checkpoints that don't contain "
                     "observation_space and action_space. Please pass env=your_env to load()."
                 )
-            # Get spaces from the environment (handles VecEnv wrappers)
+            
+            # IMPORTANT: SB3 applies VecTransposeImage wrapper which changes observation space
+            # from (H, W, C) to (C, H, W). We need to apply the same transformation.
+            # The base env has (H, W, C), but SB3 will compare against (C, H, W) after wrapping.
+            from stable_baselines3.common.vec_env import VecTransposeImage
+            
+            # Get spaces from the environment
+            # First try the wrapped env's spaces directly (if already wrapped)
             if hasattr(env, 'observation_space'):
-                data["observation_space"] = env.observation_space
+                base_obs_space = env.observation_space
             elif hasattr(env, 'envs') and len(env.envs) > 0:
-                data["observation_space"] = env.envs[0].observation_space
+                base_obs_space = env.envs[0].observation_space
             else:
                 raise ValueError("Could not extract observation_space from environment")
+            
+            # Check if VecTransposeImage will be applied - SB3 does this for image observations
+            # We need to match what SB3 will create after wrapping
+            # VecTransposeImage transposes Dict spaces with image observations from (H, W, C) to (C, H, W)
+            from gym import spaces as gym_spaces
+            
+            # Create the transposed observation space to match what SB3 expects after VecTransposeImage
+            if isinstance(base_obs_space, gym_spaces.Dict):
+                transposed_spaces = {}
+                for key, space in base_obs_space.spaces.items():
+                    if isinstance(space, gym_spaces.Box) and len(space.shape) == 3:
+                        # This is an image space - transpose from (H, W, C) to (C, H, W)
+                        h, w, c = space.shape
+                        transposed_spaces[key] = gym_spaces.Box(
+                            low=0,
+                            high=255,
+                            shape=(c, h, w),
+                            dtype=space.dtype
+                        )
+                    else:
+                        # Non-image space, keep as-is
+                        transposed_spaces[key] = space
+                data["observation_space"] = gym_spaces.Dict(transposed_spaces)
+            else:
+                # Not a Dict space, use as-is
+                data["observation_space"] = base_obs_space
             
             if hasattr(env, 'action_space'):
                 data["action_space"] = env.action_space
@@ -608,7 +641,7 @@ class CustomSAC(SAC):
             else:
                 raise ValueError("Could not extract action_space from environment")
             
-            console.log(f"[green]Spaces extracted: obs_space={data['observation_space']}, act_space={data['action_space']}[/green]")
+            console.log(f"[green]Spaces extracted (transposed for VecTransposeImage): obs_space={data['observation_space']}, act_space={data['action_space']}[/green]")
         
         # Also ensure other required SB3 fields exist
         fields_were_missing = False

@@ -630,24 +630,39 @@ class CustomSAC(SAC):
                 transposed_spaces = {}
                 for key, space in base_obs_space.spaces.items():
                     console.log(f"[cyan]Processing key '{key}': type={type(space)}, shape={space.shape if hasattr(space, 'shape') else 'N/A'}[/cyan]")
-                    if isinstance(space, gym_spaces.Box) and len(space.shape) == 3:
+                    # Check for both gym.spaces.Box and gymnasium.spaces.Box
+                    is_box_space = isinstance(space, gym_spaces.Box) or (gymnasium_Box and isinstance(space, gymnasium_Box))
+                    if is_box_space and len(space.shape) == 3:
                         # This is an image space - transpose from (H, W, C) to (C, H, W)
                         old_shape = space.shape
                         h, w, c = old_shape
                         new_shape = (c, h, w)
                         console.log(f"[yellow]Transposing '{key}' from {old_shape} to {new_shape}[/yellow]")
-                        transposed_spaces[key] = gym_spaces.Box(
-                            low=0,
-                            high=255,
-                            shape=new_shape,
-                            dtype=space.dtype
-                        )
+                        # Use gymnasium.spaces.Box if available, otherwise gym.spaces.Box
+                        if gymnasium_Box:
+                            transposed_spaces[key] = gymnasium_Box(
+                                low=0,
+                                high=255,
+                                shape=new_shape,
+                                dtype=space.dtype
+                            )
+                        else:
+                            transposed_spaces[key] = gym_spaces.Box(
+                                low=0,
+                                high=255,
+                                shape=new_shape,
+                                dtype=space.dtype
+                            )
                         console.log(f"[green]Created transposed space: {transposed_spaces[key]}[/green]")
                     else:
                         # Non-image space, keep as-is
                         transposed_spaces[key] = space
                         console.log(f"[cyan]Keeping '{key}' as-is: {space}[/cyan]")
-                data["observation_space"] = gym_spaces.Dict(transposed_spaces)
+                # Use gymnasium.spaces.Dict since the individual spaces are gymnasium types
+                if gymnasium_Dict:
+                    data["observation_space"] = gymnasium_Dict(transposed_spaces)
+                else:
+                    data["observation_space"] = gym_spaces.Dict(transposed_spaces)
                 console.log(f"[green]Final transposed observation space: {data['observation_space']}[/green]")
             else:
                 # Not a Dict space, use as-is

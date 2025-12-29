@@ -361,17 +361,22 @@ class CustomSAC(SAC):
         }
         
         # Get neural network params to save via PyTorch
-        state_dicts, pytorch_variables = self._get_torch_save_params()
+        state_dicts, pytorch_variable_names = self._get_torch_save_params()
+        
+        # params_to_save: modules/optimizers with .state_dict() method
         params_to_save = {}
         for name in state_dicts:
             attr = recursive_getattr(self, name)
             params_to_save[name] = attr.state_dict()
-        for name in pytorch_variables:
-            attr = recursive_getattr(self, name)
-            params_to_save[name] = attr
         
-        # Save to zip file - only safe_data, no risky objects
-        save_to_zip_file(path, data=safe_data, params=params_to_save, pytorch_variables=None)
+        # pytorch_vars_to_save: raw tensors like log_ent_coef
+        pytorch_vars_to_save = {}
+        for name in pytorch_variable_names:
+            attr = recursive_getattr(self, name)
+            pytorch_vars_to_save[name] = attr
+        
+        # Save to zip file with proper separation of params and pytorch_variables
+        save_to_zip_file(path, data=safe_data, params=params_to_save, pytorch_variables=pytorch_vars_to_save)
 
     def _get_torch_save_params(self):
         """a
@@ -727,12 +732,41 @@ class CustomSAC(SAC):
             with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp_file:
                 tmp_path = tmp_file.name
             
+            # Fix params if pytorch_variables were incorrectly mixed in
+            # Old save() method put raw tensors in params instead of pytorch_variables
+            if pytorch_variables is None:
+                pytorch_variables = {}
+            
+            # Check if params contains raw tensors (should be in pytorch_variables)
+            # Common ones for SAC: log_ent_coef
+            fixed_params = {}
+            for name, value in params.items():
+                if isinstance(value, torch.Tensor):
+                    # This is a raw tensor, move to pytorch_variables
+                    pytorch_variables[name] = value
+                    console.log(f"[yellow]Moved raw tensor '{name}' from params to pytorch_variables[/yellow]")
+                else:
+                    fixed_params[name] = value
+            
             # Save the patched data to the temp file
-            save_to_zip_file(tmp_path, data=data, params=params, pytorch_variables=pytorch_variables)
+            save_to_zip_file(tmp_path, data=data, params=fixed_params, pytorch_variables=pytorch_variables)
             console.log(f"[cyan]Created patched checkpoint with spaces at {tmp_path}[/cyan]")
             
             # Load from the patched checkpoint
+            # NOTE: Even though we save train_freq as tuple, pickle/json can convert it back to list
+            # So we pass train_freq through custom_objects to ensure it's a tuple
+            if custom_objects is None:
+                custom_objects = {}
+            # Force train_freq to be the correct tuple format
+            custom_objects["train_freq"] = (1, "step")
+            
             model = super(CustomSAC, cls).load(tmp_path, env=env, device=device, custom_objects=custom_objects, **kwargs)
+            
+            # After loading, force train_freq to be correct (belt and suspenders approach)
+            if hasattr(model, 'train_freq'):
+                from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
+                model.train_freq = TrainFreq(frequency=1, unit=TrainFrequencyUnit.STEP)
+                console.log(f"[green]Forced train_freq to TrainFreq(1, STEP)[/green]")
             
             # Clean up temp file
             try:

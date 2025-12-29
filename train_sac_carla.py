@@ -888,16 +888,22 @@ if __name__ == "__main__":
         console.log(f"[yellow]Resuming training from checkpoint: {args.resume}[/yellow]")
 
         
-
-        # Load the model
-
+        # CRITICAL: Pass the same policy_kwargs with custom CombinedExtractor to load()
+        # Without this, SB3 creates a default policy architecture that doesn't match the checkpoint!
+        # This is the EXACT same policy_kwargs used when creating the model above.
+        custom_objects = {
+            "policy_kwargs": policy_kwargs,  # Use the policy_kwargs defined earlier with CombinedExtractor
+        }
+        
+        # Load the model with custom objects to ensure correct architecture
         model = CustomSAC.load(
 
             args.resume, 
 
             env=env,
 
-            device="cuda" if torch.cuda.is_available() else "cpu"
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            custom_objects=custom_objects
 
         )   
 

@@ -613,26 +613,36 @@ class CustomSAC(SAC):
             # VecTransposeImage transposes Dict spaces with image observations from (H, W, C) to (C, H, W)
             from gym import spaces as gym_spaces
             
+            console.log(f"[cyan]Base obs space type: {type(base_obs_space)}, value: {base_obs_space}[/cyan]")
+            
             # Create the transposed observation space to match what SB3 expects after VecTransposeImage
             if isinstance(base_obs_space, gym_spaces.Dict):
                 transposed_spaces = {}
                 for key, space in base_obs_space.spaces.items():
+                    console.log(f"[cyan]Processing key '{key}': type={type(space)}, shape={space.shape if hasattr(space, 'shape') else 'N/A'}[/cyan]")
                     if isinstance(space, gym_spaces.Box) and len(space.shape) == 3:
                         # This is an image space - transpose from (H, W, C) to (C, H, W)
-                        h, w, c = space.shape
+                        old_shape = space.shape
+                        h, w, c = old_shape
+                        new_shape = (c, h, w)
+                        console.log(f"[yellow]Transposing '{key}' from {old_shape} to {new_shape}[/yellow]")
                         transposed_spaces[key] = gym_spaces.Box(
                             low=0,
                             high=255,
-                            shape=(c, h, w),
+                            shape=new_shape,
                             dtype=space.dtype
                         )
+                        console.log(f"[green]Created transposed space: {transposed_spaces[key]}[/green]")
                     else:
                         # Non-image space, keep as-is
                         transposed_spaces[key] = space
+                        console.log(f"[cyan]Keeping '{key}' as-is: {space}[/cyan]")
                 data["observation_space"] = gym_spaces.Dict(transposed_spaces)
+                console.log(f"[green]Final transposed observation space: {data['observation_space']}[/green]")
             else:
                 # Not a Dict space, use as-is
                 data["observation_space"] = base_obs_space
+                console.log(f"[yellow]Not a Dict space, using base_obs_space as-is[/yellow]")
             
             if hasattr(env, 'action_space'):
                 data["action_space"] = env.action_space
